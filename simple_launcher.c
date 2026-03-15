@@ -1,5 +1,5 @@
 /*
- * simple_launcher.c - Simple Launcher v1.95
+ * simple_launcher.c - Simple Launcher v2.00
  *
  * Features:
  *   - INI-configured buttons with optional icons, separators, admin elevation
@@ -17,11 +17,14 @@
  *   - Search / filter bar - type to instantly filter buttons by name
  *   - Compact mode - icon-only grid palette for a tiny always-on-top layout
  *   - Open file location from right-click context menu
- *   - Version 1.95
+ *   - Profiles - switchable INI sets from tray or Profiles menu
+ *   - Environment variables - %VAR% expanded in path, args, and working dir
+ *   - Launch mode per button - Normal, Minimized, or Hidden
+ *   - Version 2.00
  *
  * Compile:
  *
- *   cl simple_launcher.c simple_launcher.res /link user32.lib shell32.lib comdlg32.lib gdi32.lib dwmapi.lib ole32.lib /subsystem:windows /out:simple_launcher.exe
+ *   cl simple_launcher.c simple_launcher.res /link user32.lib shell32.lib comdlg32.lib gdi32.lib dwmapi.lib ole32.lib comctl32.lib /subsystem:windows /out:simple_launcher.exe
  */
 
 #include <windows.h>
@@ -29,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <commdlg.h>
+#include <commctrl.h>
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -38,8 +42,14 @@ static void RefreshMainWindow(void);
 static void RebuildMenu(void);
 static void ApplyDarkBackground(void);
 static void SaveAll(void);
+static void LoadSettings(void);
+static void LoadButtons(void);
 static void LoadButtonIcons(void);
+static void FreeIcons(void);
+static void RecreateFont(void);
 static void SetTitleBarDark(HWND hwnd, int dark);
+static void ScanProfiles(void);
+static void SwitchProfile(int idx);
 
 /* ── IDs ─────────────────────────────────────────────────────────────── */
 #define ID_ADD_BTN            1
@@ -75,13 +85,20 @@ static void SetTitleBarDark(HWND hwnd, int dark);
 #define IDC_WORKDIR_BROWSE    42
 #define IDC_COMPACT_CHECK     45
 #define IDC_CAT_CHECK         46
+#define IDC_LAUNCH_COMBO      47   /* Normal / Minimized / Hidden */
 #define IDC_SEARCH_EDIT       60
+
+/* Prompt dialog (new profile name) */
+#define IDC_PROMPT_EDIT       50
+#define IDC_PROMPT_OK         51
+#define IDC_PROMPT_CANCEL     52
 
 /* Menu IDs */
 #define ID_HELP_INSTRUCTIONS  20
 #define ID_HELP_ABOUT         21
 #define ID_SETTINGS           22
 #define ID_OPEN_INI           23
+#define ID_PROFILES_MENU      24
 
 /* Right-click context menu */
 #define IDM_MOVE_UP           300
@@ -96,6 +113,12 @@ static void SetTitleBarDark(HWND hwnd, int dark);
 #define ID_TRAY_ICON          1
 #define IDM_TRAY_RESTORE      400
 #define IDM_TRAY_EXIT         401
+
+/* Profiles */
+#define IDM_PROFILE_BASE      600   /* 600..615 → switch to profile N */
+#define IDM_PROFILE_NEW       616
+#define IDM_PROFILE_DELETE    617
+#define MAX_PROFILES          16
 
 /* ── Dark mode colors ───────────────────────────────────────────────── */
 #define DK_BG       RGB( 28,  28,  28)
@@ -113,8 +136,8 @@ static void SetTitleBarDark(HWND hwnd, int dark);
 #define DK_CAT_TEXT RGB(200, 225, 255)
 #define LT_CAT_TEXT RGB( 20,  50, 100)
 
-static const char *g_menuLabels[] = { "Instructions", "Settings", "Open INI", "About" };
-static const UINT  g_menuIDs[]    = { ID_HELP_INSTRUCTIONS, ID_SETTINGS, ID_OPEN_INI, ID_HELP_ABOUT };
+static const char *g_menuLabels[] = { "Instructions", "Settings", "Profiles", "Open INI", "About" };
+static const UINT  g_menuIDs[]    = { ID_HELP_INSTRUCTIONS, ID_SETTINGS, ID_PROFILES_MENU, ID_OPEN_INI, ID_HELP_ABOUT };
 
 /* ── Data ────────────────────────────────────────────────────────────── */
 typedef struct {
@@ -127,6 +150,7 @@ typedef struct {
     int  isSeparator;
     int  isCategory;    /* collapsible group header */
     int  showIcon;
+    int  launchMode;    /* 0=Normal, 1=Minimized, 2=Hidden */
 } ButtonConfig;
 
 static ButtonConfig g_buttons[MAX_BUTTONS];
@@ -164,6 +188,18 @@ static COLORREF     g_settingColor;
 static COLORREF     g_customColors[16];
 static HWND         g_hwndSearch   = NULL;
 static char         g_filterText[256] = "";
+
+/* Profiles */
+static char         g_basePath[MAX_PATH];
+static char         g_profileNames[MAX_PROFILES][64];
+static char         g_profilePaths[MAX_PROFILES][MAX_PATH];
+static int          g_profileCount  = 0;
+static int          g_activeProfile = 0;
+
+/* Prompt dialog (new profile name input) */
+static char         g_promptResult[64];
+static int          g_promptDone      = 0;
+static int          g_promptCancelled = 0;
 
 static const char  *g_infoDlgTitle   = NULL;
 static const char  *g_infoDlgContent = NULL;
@@ -236,19 +272,101 @@ static void RemoveTrayIcon(void)
 }
 
 /* ── INI ─────────────────────────────────────────────────────────────── */
-static void GetIniPath(void)
+static void GetBasePath(void)
 {
-    GetModuleFileName(NULL, g_iniPath, MAX_PATH);
-    char *dot = strrchr(g_iniPath, '.');
+    GetModuleFileName(NULL, g_basePath, MAX_PATH);
+    char *dot = strrchr(g_basePath, '.');
     if (dot) {
-        /* Replace extension in-place — safe because ".ini" <= any extension */
         strcpy(dot, ".ini");
     } else {
-        /* No extension: append only if there is room */
-        size_t len = strlen(g_iniPath);
-        if (len + 4 < MAX_PATH)
-            strcat(g_iniPath, ".ini");
+        size_t len = strlen(g_basePath);
+        if (len + 4 < MAX_PATH) strcat(g_basePath, ".ini");
     }
+    strcpy(g_iniPath, g_basePath);
+}
+
+/* ── Profiles ────────────────────────────────────────────────────────── */
+static void ScanProfiles(void)
+{
+    g_profileCount = 0;
+    strcpy(g_profileNames[0], "Default");
+    strcpy(g_profilePaths[0], g_basePath);
+    g_profileCount = 1;
+
+    char dir[MAX_PATH]; strcpy(dir, g_basePath);
+    char *ls = strrchr(dir, '\\'); if (!ls) ls = strrchr(dir, '/');
+    if (ls) *(ls + 1) = '\0'; else dir[0] = '\0';
+
+    char pat[MAX_PATH];
+    snprintf(pat, MAX_PATH, "%slauncher_*.ini", dir);
+    WIN32_FIND_DATA fd;
+    HANDLE h = FindFirstFile(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (g_profileCount >= MAX_PROFILES) break;
+            char nm[64];
+            strncpy(nm, fd.cFileName + 9, 63); nm[63] = '\0'; /* strip "launcher_" (9 chars) */
+            char *dot2 = strrchr(nm, '.'); if (dot2) *dot2 = '\0';
+            if (!nm[0]) continue;
+            strcpy(g_profileNames[g_profileCount], nm);
+            snprintf(g_profilePaths[g_profileCount], MAX_PATH, "%s%s", dir, fd.cFileName);
+            g_profileCount++;
+        } while (FindNextFile(h, &fd));
+        FindClose(h);
+    }
+
+    char active[64];
+    GetPrivateProfileString("Meta", "ActiveProfile", "Default",
+                            active, sizeof(active), g_basePath);
+    g_activeProfile = 0;
+    for (int i = 0; i < g_profileCount; i++)
+        if (_stricmp(g_profileNames[i], active) == 0) { g_activeProfile = i; break; }
+    strcpy(g_iniPath, g_profilePaths[g_activeProfile]);
+}
+
+static void SwitchProfile(int idx)
+{
+    if (idx < 0 || idx >= g_profileCount || idx == g_activeProfile) return;
+    SaveAll();
+    g_activeProfile = idx;
+    strcpy(g_iniPath, g_profilePaths[idx]);
+    WritePrivateProfileString("Meta", "ActiveProfile",
+                              g_profileNames[idx], g_basePath);
+    FreeIcons();
+    g_count = 0;
+    memset(g_buttons,   0, sizeof(g_buttons));
+    memset(g_collapsed, 0, sizeof(g_collapsed));
+    g_filterText[0] = '\0';
+    if (g_hwndSearch) SetWindowText(g_hwndSearch, "");
+    LoadSettings();
+    LoadButtons();
+    RecreateFont();
+    /* LoadButtonIcons called inside RefreshMainWindow */
+    ApplyDarkBackground();
+    SetTitleBarDark(g_hwndMain, g_darkMode);
+    SetWindowText(g_hwndMain, g_winTitle);
+    SetWindowPos(g_hwndMain,
+                 g_alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
+                 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    ApplyOpacity();
+    RebuildMenu();
+    RefreshMainWindow();
+}
+
+static void ShowProfilesMenu(HWND hwnd, int x, int y)
+{
+    HMENU hM = CreatePopupMenu();
+    for (int i = 0; i < g_profileCount; i++) {
+        UINT flags = MF_STRING | (i == g_activeProfile ? MF_CHECKED : 0);
+        AppendMenu(hM, flags, IDM_PROFILE_BASE + i, g_profileNames[i]);
+    }
+    AppendMenu(hM, MF_SEPARATOR, 0, NULL);
+    AppendMenu(hM, MF_STRING, IDM_PROFILE_NEW, "New Profile...");
+    AppendMenu(hM, MF_STRING | (g_activeProfile == 0 ? MF_GRAYED : 0),
+               IDM_PROFILE_DELETE, "Delete Current Profile");
+    SetForegroundWindow(hwnd);
+    TrackPopupMenu(hM, TPM_LEFTBUTTON, x, y, 0, hwnd, NULL);
+    DestroyMenu(hM);
 }
 
 static void LoadSettings(void)
@@ -303,6 +421,9 @@ static void LoadButtons(void)
         g_buttons[i].isSeparator = GetPrivateProfileInt(sec, "Separator",  0, g_iniPath);
         g_buttons[i].isCategory  = GetPrivateProfileInt(sec, "IsCategory", 0, g_iniPath);
         g_buttons[i].showIcon    = GetPrivateProfileInt(sec, "ShowIcon",   0, g_iniPath);
+        g_buttons[i].launchMode  = GetPrivateProfileInt(sec, "LaunchMode", 0, g_iniPath);
+        if (g_buttons[i].launchMode < 0 || g_buttons[i].launchMode > 2)
+            g_buttons[i].launchMode = 0;   /* clamp invalid values to Normal */
         g_collapsed[i] = 0;
     }
 }
@@ -344,11 +465,24 @@ static void SaveAll(void)
         fprintf(f, "Separator=%d\r\n",  g_buttons[i].isSeparator);
         fprintf(f, "IsCategory=%d\r\n", g_buttons[i].isCategory);
         fprintf(f, "ShowIcon=%d\r\n",   g_buttons[i].showIcon);
+        fprintf(f, "LaunchMode=%d\r\n", g_buttons[i].launchMode);
     }
     fclose(f);
 }
 
-/* ── Icons ───────────────────────────────────────────────────────────── */
+/* ── Environment variable expansion ─────────────────────────────────── */
+/* Expands %VAR% tokens in src into dst (MAX_PATH). Falls back to src   */
+/* unchanged if ExpandEnvironmentStrings fails or dst would overflow.   */
+static void ExpandEnvVars(const char *src, char *dst, DWORD dstSize)
+{
+    if (!src || !src[0]) { if (dst && dstSize) dst[0] = '\0'; return; }
+    DWORD result = ExpandEnvironmentStrings(src, dst, dstSize);
+    if (result == 0 || result > dstSize) {
+        /* Failed or overflow — copy as-is, safely truncated */
+        strncpy(dst, src, dstSize - 1);
+        dst[dstSize - 1] = '\0';
+    }
+}
 static void FreeIcons(void)
 {
     for (int i = 0; i < MAX_BUTTONS; i++) {
@@ -483,7 +617,7 @@ static void DrawButton(LPDRAWITEMSTRUCT dis, int idx)
     HFONT hOldFont = g_hFont ? (HFONT)SelectObject(dis->hDC, g_hFont) : NULL;
     RECT textRc = { textLeft, rc.top, rc.right, rc.bottom };
     if (pressed) OffsetRect(&textRc, 1, 1);
-    const char *label = (idx == -1) ? "+ Add Button" :
+    const char *label = (idx == -1) ? "+ Add Button / Separator / Header" :
                         (idx >= 0 && idx < g_count) ? g_buttons[idx].name : "";
     DrawText(dis->hDC, label, -1, &textRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     if (hOldFont) SelectObject(dis->hDC, hOldFont);
@@ -652,8 +786,14 @@ static void RefreshMainWindow(void)
                     pos += snprintf(tip + pos, sizeof(g_tooltipText[i]) - pos,
                                     "\nDir:  %s", g_buttons[i].workDir);
                 if (g_buttons[i].admin)
+                    pos += snprintf(tip + pos, sizeof(g_tooltipText[i]) - pos,
+                                    "\n[Run as Administrator]");
+                if (g_buttons[i].launchMode == 1)
+                    pos += snprintf(tip + pos, sizeof(g_tooltipText[i]) - pos,
+                                    "\n[Launch Minimized]");
+                else if (g_buttons[i].launchMode == 2)
                     snprintf(tip + pos, sizeof(g_tooltipText[i]) - pos,
-                             "\n[Run as Administrator]");
+                             "\n[Launch Hidden]");
             }
             TOOLINFO ti; ZeroMemory(&ti, sizeof(ti));
             ti.cbSize   = sizeof(TOOLINFO);
@@ -870,6 +1010,41 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
+/* ── Prompt dialog (single text input — used for new profile name) ───── */
+static HBRUSH g_hbrPromptBg = NULL;
+
+static LRESULT CALLBACK PromptDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    LRESULT dark = HandleDlgDarkColor(hwnd, msg, wParam, &g_hbrPromptBg);
+    if (dark != -1) return dark;
+    switch (msg) {
+    case WM_CREATE:
+        CreateWindow("STATIC", "Profile name:", WS_VISIBLE|WS_CHILD,
+                     10, 12, 110, 18, hwnd, NULL, g_hInst, NULL);
+        CreateWindow("EDIT", "", WS_VISIBLE|WS_CHILD|WS_BORDER|ES_AUTOHSCROLL|WS_TABSTOP,
+                     10, 34, 284, 22, hwnd, (HMENU)IDC_PROMPT_EDIT, g_hInst, NULL);
+        CreateWindow("BUTTON", "OK", WS_VISIBLE|WS_CHILD|BS_DEFPUSHBUTTON|WS_TABSTOP,
+                     114, 66, 80, 26, hwnd, (HMENU)IDC_PROMPT_OK, g_hInst, NULL);
+        CreateWindow("BUTTON", "Cancel", WS_VISIBLE|WS_CHILD|BS_PUSHBUTTON|WS_TABSTOP,
+                     204, 66, 80, 26, hwnd, (HMENU)IDC_PROMPT_CANCEL, g_hInst, NULL);
+        return 0;
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_PROMPT_OK) {
+            GetDlgItemText(hwnd, IDC_PROMPT_EDIT, g_promptResult, sizeof(g_promptResult));
+            g_promptDone = 1; DestroyWindow(hwnd);
+        } else if (LOWORD(wParam) == IDC_PROMPT_CANCEL) {
+            g_promptResult[0] = '\0'; g_promptCancelled = 1; g_promptDone = 1; DestroyWindow(hwnd);
+        }
+        return 0;
+    case WM_CLOSE:
+        g_promptResult[0] = '\0'; g_promptCancelled = 1; g_promptDone = 1; DestroyWindow(hwnd); return 0;
+    case WM_DESTROY:
+        if (g_hbrPromptBg) { DeleteObject(g_hbrPromptBg); g_hbrPromptBg = NULL; }
+        g_hwndDlg = NULL; return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
 /* ── Add / Edit dialog ───────────────────────────────────────────────── */
 static HBRUSH g_hbrAddBg = NULL;
 
@@ -916,25 +1091,35 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                      10, 225, 220, 22, hwnd, (HMENU)IDC_ADMIN_CHECK, g_hInst, NULL);
         if (edit && bc->admin) SendDlgItemMessage(hwnd, IDC_ADMIN_CHECK, BM_SETCHECK, BST_CHECKED, 0);
 
+        CreateWindow("STATIC", "Launch mode:",
+                     WS_VISIBLE|WS_CHILD, 10, 254, 90, 18, hwnd, NULL, g_hInst, NULL);
+        { HWND hCb = CreateWindow("COMBOBOX", "",
+                     WS_VISIBLE|WS_CHILD|WS_TABSTOP|CBS_DROPDOWNLIST,
+                     105, 252, 150, 80, hwnd, (HMENU)IDC_LAUNCH_COMBO, g_hInst, NULL);
+          SendMessage(hCb, CB_ADDSTRING, 0, (LPARAM)"Normal");
+          SendMessage(hCb, CB_ADDSTRING, 0, (LPARAM)"Minimized");
+          SendMessage(hCb, CB_ADDSTRING, 0, (LPARAM)"Hidden");
+          SendMessage(hCb, CB_SETCURSEL, edit ? bc->launchMode : 0, 0); }
+
         CreateWindow("BUTTON", "Show icon from program",
                      WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX,
-                     10, 250, 220, 20, hwnd, (HMENU)IDC_ICON_CHECK, g_hInst, NULL);
+                     10, 280, 220, 20, hwnd, (HMENU)IDC_ICON_CHECK, g_hInst, NULL);
         if (edit && bc->showIcon) SendDlgItemMessage(hwnd, IDC_ICON_CHECK, BM_SETCHECK, BST_CHECKED, 0);
 
         CreateWindow("STATIC", "Custom icon (ICO/PNG, optional):",
-                     WS_VISIBLE|WS_CHILD, 10, 278, 220, 18, hwnd, NULL, g_hInst, NULL);
+                     WS_VISIBLE|WS_CHILD, 10, 308, 220, 18, hwnd, NULL, g_hInst, NULL);
         CreateWindow("EDIT", edit ? bc->iconPath : "",
                      WS_VISIBLE|WS_CHILD|WS_BORDER|ES_AUTOHSCROLL,
-                     10, 298, 285, 22, hwnd, (HMENU)IDC_ICON_PATH_EDIT, g_hInst, NULL);
+                     10, 328, 285, 22, hwnd, (HMENU)IDC_ICON_PATH_EDIT, g_hInst, NULL);
         CreateWindow("BUTTON", "Browse...", WS_VISIBLE|WS_CHILD|BS_PUSHBUTTON,
-                     305, 298, 75, 22, hwnd, (HMENU)IDC_ICON_BROWSE, g_hInst, NULL);
+                     305, 328, 75, 22, hwnd, (HMENU)IDC_ICON_BROWSE, g_hInst, NULL);
 
         CreateWindow("BUTTON", "Separator (divider line)",
                      WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX,
-                     10, 328, 220, 20, hwnd, (HMENU)IDC_SEP_CHECK, g_hInst, NULL);
+                     10, 358, 220, 20, hwnd, (HMENU)IDC_SEP_CHECK, g_hInst, NULL);
         CreateWindow("BUTTON", "Category header (collapsible group)",
                      WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX,
-                     10, 352, 255, 20, hwnd, (HMENU)IDC_CAT_CHECK, g_hInst, NULL);
+                     10, 382, 255, 20, hwnd, (HMENU)IDC_CAT_CHECK, g_hInst, NULL);
         if (edit && bc->isSeparator) {
             SendDlgItemMessage(hwnd, IDC_SEP_CHECK, BM_SETCHECK, BST_CHECKED, 0);
             EnableWindow(GetDlgItem(hwnd, IDC_NAME_EDIT),       FALSE);
@@ -965,10 +1150,10 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
         CreateWindow("BUTTON", edit ? "Save" : "Add",
                      WS_VISIBLE|WS_CHILD|BS_DEFPUSHBUTTON,
-                     210, 388, 80, 28, hwnd, (HMENU)IDC_OK, g_hInst, NULL);
+                     210, 418, 80, 28, hwnd, (HMENU)IDC_OK, g_hInst, NULL);
         CreateWindow("BUTTON", "Cancel",
                      WS_VISIBLE|WS_CHILD|BS_PUSHBUTTON,
-                     300, 388, 80, 28, hwnd, (HMENU)IDC_CANCEL, g_hInst, NULL);
+                     300, 418, 80, 28, hwnd, (HMENU)IDC_CANCEL, g_hInst, NULL);
         return 0;
     }
 
@@ -1097,6 +1282,8 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 g_buttons[ti].admin    = (SendDlgItemMessage(hwnd, IDC_ADMIN_CHECK, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
                 g_buttons[ti].showIcon = (SendDlgItemMessage(hwnd, IDC_ICON_CHECK,  BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
                 g_buttons[ti].isCategory = 0;
+                int lm = (int)SendDlgItemMessage(hwnd, IDC_LAUNCH_COMBO, CB_GETCURSEL, 0, 0);
+                g_buttons[ti].launchMode = (lm >= 0 && lm <= 2) ? lm : 0;
             }
             g_buttons[ti].isSeparator = isSep;
             if (g_editIndex < 0) g_count++;
@@ -1198,7 +1385,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     switch (msg) {
 
     case WM_CREATE:
-        CreateWindow("BUTTON", "+ Add Button", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW,
+        CreateWindow("BUTTON", "+ Add Button / Separator / Header", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW,
                      10, 10, g_winWidth - 20, 26,
                      hwnd, (HMENU)ID_ADD_BTN, g_hInst, NULL);
         return 0;
@@ -1231,10 +1418,21 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             SetForegroundWindow(hwnd);
         } else if (lParam == WM_RBUTTONUP) {
             POINT pt; GetCursorPos(&pt);
+            HMENU hSub = CreatePopupMenu();
+            for (int i = 0; i < g_profileCount; i++) {
+                UINT f = MF_STRING | (i == g_activeProfile ? MF_CHECKED : 0);
+                AppendMenu(hSub, f, IDM_PROFILE_BASE + i, g_profileNames[i]);
+            }
+            AppendMenu(hSub, MF_SEPARATOR, 0, NULL);
+            AppendMenu(hSub, MF_STRING, IDM_PROFILE_NEW, "New Profile...");
+            AppendMenu(hSub, MF_STRING | (g_activeProfile == 0 ? MF_GRAYED : 0),
+                       IDM_PROFILE_DELETE, "Delete Current Profile");
             HMENU hM = CreatePopupMenu();
-            AppendMenu(hM, MF_STRING,   IDM_TRAY_RESTORE, "Restore");
+            AppendMenu(hM, MF_POPUP, (UINT_PTR)hSub, "Profiles");
             AppendMenu(hM, MF_SEPARATOR, 0, NULL);
-            AppendMenu(hM, MF_STRING,   IDM_TRAY_EXIT, "Exit");
+            AppendMenu(hM, MF_STRING, IDM_TRAY_RESTORE, "Restore");
+            AppendMenu(hM, MF_SEPARATOR, 0, NULL);
+            AppendMenu(hM, MF_STRING, IDM_TRAY_EXIT, "Exit");
             SetForegroundWindow(hwnd);
             int cmd = TrackPopupMenu(hM, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
             DestroyMenu(hM);
@@ -1242,6 +1440,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 RemoveTrayIcon(); ShowWindow(hwnd, SW_RESTORE); SetForegroundWindow(hwnd);
             } else if (cmd == IDM_TRAY_EXIT) {
                 RemoveTrayIcon(); SaveAll(); DestroyWindow(hwnd);
+            } else if (cmd >= IDM_PROFILE_BASE && cmd < IDM_PROFILE_BASE + g_profileCount) {
+                SwitchProfile(cmd - IDM_PROFILE_BASE);
+            } else if (cmd == IDM_PROFILE_NEW) {
+                PostMessage(hwnd, WM_COMMAND, IDM_PROFILE_NEW, 0);
+            } else if (cmd == IDM_PROFILE_DELETE) {
+                PostMessage(hwnd, WM_COMMAND, IDM_PROFILE_DELETE, 0);
             }
         }
         return 0;
@@ -1289,7 +1493,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             HFONT hOld = (HFONT)SelectObject(hdc, hMenuFont);
             SIZE sz; GetTextExtentPoint32(hdc, label, (int)strlen(label), &sz);
             SelectObject(hdc, hOld); ReleaseDC(hwnd, hdc);
-            mis->itemWidth  = sz.cx + 20;
+            mis->itemWidth  = sz.cx + 4;   /* minimal padding — 5 items must fit in one row */
             mis->itemHeight = GetSystemMetrics(SM_CYMENU); /* match system bar height exactly */
             return TRUE;
         }
@@ -1355,7 +1559,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             g_editIndex = g_ctxIndex; g_ctxIndex = -1;
             g_hwndDlg = CreateWindowEx(WS_EX_DLGMODALFRAME, "AddDlgClass", "Edit Button",
                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                CW_USEDEFAULT, CW_USEDEFAULT, 400, 460,
+                CW_USEDEFAULT, CW_USEDEFAULT, 400, 490,
                 hwnd, NULL, g_hInst, NULL);
             SetTitleBarDark(g_hwndDlg, g_darkMode);
             ShowWindow(g_hwndDlg, SW_SHOW); UpdateWindow(g_hwndDlg);
@@ -1398,9 +1602,11 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
         } else if (id == IDM_OPEN_LOCATION && g_ctxIndex >= 0) {
             if (g_buttons[g_ctxIndex].path[0]) {
-                /* Extract directory from path and open in Explorer */
+                /* Expand env vars before extracting directory */
+                char expanded[MAX_PATH];
+                ExpandEnvVars(g_buttons[g_ctxIndex].path, expanded, MAX_PATH);
                 char dir[MAX_PATH];
-                strncpy(dir, g_buttons[g_ctxIndex].path, MAX_PATH - 1);
+                strncpy(dir, expanded, MAX_PATH - 1);
                 dir[MAX_PATH - 1] = '\0';
                 char *slash = strrchr(dir, '\\');
                 if (!slash) slash = strrchr(dir, '/');
@@ -1408,6 +1614,82 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 ShellExecute(NULL, "explore", dir, NULL, NULL, SW_SHOW);
             }
             g_ctxIndex = -1;
+
+        } else if (id >= IDM_PROFILE_BASE && id < IDM_PROFILE_BASE + g_profileCount) {
+            SwitchProfile(id - IDM_PROFILE_BASE);
+
+        } else if (id == ID_PROFILES_MENU) {
+            POINT pt; GetCursorPos(&pt);
+            ShowProfilesMenu(hwnd, pt.x, pt.y);
+
+        } else if (id == IDM_PROFILE_NEW) {
+            if (g_hwndDlg) { SetForegroundWindow(g_hwndDlg); return 0; }
+            g_promptResult[0] = '\0'; g_promptDone = 0; g_promptCancelled = 0;
+            HWND hPr = CreateWindowEx(WS_EX_DLGMODALFRAME, "PromptDlgClass", "New Profile Name",
+                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+                CW_USEDEFAULT, CW_USEDEFAULT, 316, 140,
+                hwnd, NULL, g_hInst, NULL);
+            g_hwndDlg = hPr; SetTitleBarDark(hPr, g_darkMode);
+            ShowWindow(hPr, SW_SHOW); UpdateWindow(hPr);
+            MSG pmsg;
+            while (!g_promptDone && GetMessage(&pmsg, NULL, 0, 0)) {
+                if (IsWindow(hPr) && IsDialogMessage(hPr, &pmsg)) continue;
+                TranslateMessage(&pmsg); DispatchMessage(&pmsg);
+            }
+            if (!g_promptCancelled && g_promptResult[0]) {
+                /* Sanitise name */
+                char safe[64]; int si = 0;
+                for (int i = 0; g_promptResult[i] && si < 63; i++) {
+                    char c = g_promptResult[i];
+                    if (c!='/' && c!='\\' && c!=':' && c!='*' && c!='?' &&
+                        c!='"' && c!='<' && c!='>' && c!='|')
+                        safe[si++] = c;
+                }
+                safe[si] = '\0';
+                if (!safe[0] || _stricmp(safe, "Default") == 0) {
+                    MessageBox(hwnd, "Invalid or reserved profile name.", "Error", MB_OK | MB_ICONWARNING);
+                } else {
+                    /* Check for duplicate */
+                    int dup = 0;
+                    for (int i = 0; i < g_profileCount; i++)
+                        if (_stricmp(g_profileNames[i], safe) == 0) { dup = 1; break; }
+                    if (dup) {
+                        char duptxt[128];
+                        snprintf(duptxt, sizeof(duptxt), "A profile named \"%s\" already exists.", safe);
+                        MessageBox(hwnd, duptxt, "Duplicate Profile", MB_OK | MB_ICONWARNING);
+                    } else {
+                        char dir[MAX_PATH]; strcpy(dir, g_basePath);
+                        char *ls = strrchr(dir, '\\'); if (!ls) ls = strrchr(dir, '/');
+                        if (ls) *(ls + 1) = '\0'; else dir[0] = '\0';
+                        /* Guard: ensure the full path won't exceed MAX_PATH */
+                        if (strlen(dir) + 9 + strlen(safe) + 4 >= MAX_PATH) {
+                            MessageBox(hwnd, "Profile name is too long.", "Error", MB_OK | MB_ICONWARNING);
+                        } else {
+                            char newPath[MAX_PATH];
+                            snprintf(newPath, MAX_PATH, "%slauncher_%s.ini", dir, safe);
+                            FILE *tf = fopen(newPath, "a"); if (tf) fclose(tf);
+                            ScanProfiles();
+                            for (int i = 0; i < g_profileCount; i++)
+                                if (_stricmp(g_profileNames[i], safe) == 0) { SwitchProfile(i); break; }
+                        }
+                    }
+                }
+            }
+
+        } else if (id == IDM_PROFILE_DELETE) {
+            if (g_activeProfile == 0) {
+                MessageBox(hwnd, "Cannot delete the Default profile.", "Error", MB_OK | MB_ICONWARNING);
+            } else {
+                char confirm[200];
+                snprintf(confirm, sizeof(confirm), "Delete profile \"%s\"?", g_profileNames[g_activeProfile]);
+                if (MessageBox(hwnd, confirm, "Confirm Delete", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                    char delPath[MAX_PATH]; strcpy(delPath, g_profilePaths[g_activeProfile]);
+                    SwitchProfile(0);
+                    DeleteFile(delPath);
+                    ScanProfiles();
+                    RebuildMenu();
+                }
+            }
 
         } else if (id == ID_OPEN_INI) {
             ShellExecute(NULL, "open", "notepad.exe", g_iniPath, NULL, SW_SHOW);
@@ -1420,49 +1702,45 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 "\r\n"
                 "ADDING A BUTTON\r\n"
                 "Click '+ Add Button'. Fill in:\r\n"
-                "  - Display name: label shown on the button\r\n"
-                "  - Path to launch: full path to a program or file\r\n"
-                "  - Arguments / options: optional command-line arguments\r\n"
-                "  - Working directory: folder the program starts in (optional)\r\n"
-                "  - Run as administrator: triggers a UAC elevation prompt\r\n"
-                "  - Show icon from program: shows the .exe icon on the button\r\n"
-                "  - Separator: inserts a thin divider line instead of a button\r\n"
-                "  - Category header: inserts a collapsible group label\r\n"
+                "  - Display name, Path, Arguments, Working directory\r\n"
+                "  - Launch mode: Normal, Minimized, or Hidden\r\n"
+                "  - Run as administrator (UAC prompt)\r\n"
+                "  - Show icon / Custom icon\r\n"
+                "  - Separator or Category header\r\n"
+                "\r\n"
+                "ENVIRONMENT VARIABLES\r\n"
+                "Use %VAR% tokens in Path, Arguments, and Working Directory. "
+                "They are expanded at launch time. Examples:\r\n"
+                "  %USERPROFILE%\\Documents\\script.bat\r\n"
+                "  %APPDATA%\\MyApp\\app.exe\r\n"
+                "\r\n"
+                "PROFILES\r\n"
+                "Profiles let you keep separate button sets in different INI "
+                "files. Use the Profiles menu (menu bar or tray) to switch, "
+                "create, or delete profiles. The Default profile (launcher.ini) "
+                "cannot be deleted. Profile files are named launcher_<name>.ini.\r\n"
+                "\r\n"
+                "LAUNCH MODE\r\n"
+                "Normal: standard window. Minimized: starts in the taskbar. "
+                "Hidden: no window shown (useful for background scripts).\r\n"
                 "\r\n"
                 "CATEGORIES\r\n"
-                "Add a 'Category header' to group buttons under a labelled "
-                "collapsible section. Click the category bar to collapse or "
-                "expand the buttons beneath it.\r\n"
+                "Add a 'Category header' to group buttons under a collapsible "
+                "section. Click the category bar to collapse or expand it.\r\n"
                 "\r\n"
                 "SEARCH / FILTER\r\n"
-                "Type in the search bar at the top to instantly filter buttons "
-                "by name. Category headers and separators are hidden while a "
-                "filter is active.\r\n"
+                "Type in the search bar to instantly filter buttons by name.\r\n"
                 "\r\n"
                 "COMPACT MODE\r\n"
-                "Enable in Settings for a small icon-grid palette. Each tile "
-                "shows the program icon or first letter. Hover for the full name.\r\n"
+                "Enable in Settings for a small icon-grid palette.\r\n"
                 "\r\n"
-                "EDITING / DELETING / REORDERING\r\n"
-                "Right-click any button to: Edit, Duplicate, Open File Location, "
-                "Delete, Move Up, or Move Down.\r\n"
-                "\r\n"
-                "TOOLTIPS\r\n"
-                "Hover over any button to see its full path, arguments, and "
-                "working directory.\r\n"
-                "\r\n"
-                "ADMIN BORDER COLOR\r\n"
-                "Buttons set to run as administrator display a colored border. "
-                "The color can be customised in Settings.\r\n"
-                "\r\n"
-                "SETTINGS\r\n"
-                "Dark mode, admin border color, font size, window width, "
-                "always on top, minimize to tray, compact mode, title, opacity.\r\n"
+                "RIGHT-CLICK MENU\r\n"
+                "Edit, Duplicate, Open File Location, Delete, Move Up/Down.\r\n"
                 "\r\n"
                 "CONFIGURATION FILE\r\n"
-                "All settings are saved automatically to launcher.ini in the "
-                "same folder as launcher.exe. Click 'Open INI' in the menu bar "
-                "to open it directly in Notepad.");
+                "Settings are saved to launcher.ini (Default) or "
+                "launcher_<name>.ini for named profiles, next to launcher.exe. "
+                "Click 'Open INI' to open the active profile in Notepad.");
 
         } else if (id == ID_SETTINGS) {
             if (g_hwndDlg) { SetForegroundWindow(g_hwndDlg); break; }
@@ -1476,7 +1754,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         } else if (id == ID_HELP_ABOUT) {
             ShowInfoDialog(hwnd, "About Simple Launcher",
                 "Simple Launcher\r\n"
-                "Version 1.95\r\n"
+                "Version 2.00\r\n"
                 "\r\n"
                 "Author:   UberGuidoZ\r\n"
                 "Contact:  https://github.com/UberGuidoZ");
@@ -1486,7 +1764,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             g_editIndex = -1;
             g_hwndDlg = CreateWindowEx(WS_EX_DLGMODALFRAME, "AddDlgClass", "Add Button",
                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                CW_USEDEFAULT, CW_USEDEFAULT, 400, 460,
+                CW_USEDEFAULT, CW_USEDEFAULT, 400, 490,
                 hwnd, NULL, g_hInst, NULL);
             SetTitleBarDark(g_hwndDlg, g_darkMode);
             ShowWindow(g_hwndDlg, SW_SHOW); UpdateWindow(g_hwndDlg);
@@ -1500,17 +1778,23 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 return 0;
             }
             if (!g_buttons[idx].isSeparator) {
-                const char *workDir = g_buttons[idx].workDir[0] ? g_buttons[idx].workDir : NULL;
+                char exPath[MAX_PATH], exArgs[512], exDir[MAX_PATH];
+                ExpandEnvVars(g_buttons[idx].path,    exPath, MAX_PATH);
+                ExpandEnvVars(g_buttons[idx].args,    exArgs, sizeof(exArgs));
+                ExpandEnvVars(g_buttons[idx].workDir, exDir,  MAX_PATH);
+                const char *workDir = exDir[0] ? exDir : NULL;
+                const char *args    = exArgs[0] ? exArgs : NULL;
+                int nShow = SW_SHOW;
+                if (g_buttons[idx].launchMode == 1) nShow = SW_SHOWMINIMIZED;
+                else if (g_buttons[idx].launchMode == 2) nShow = SW_HIDE;
                 HINSTANCE hRet = ShellExecute(NULL,
                                      g_buttons[idx].admin ? "runas" : "open",
-                                     g_buttons[idx].path,
-                                     g_buttons[idx].args[0] ? g_buttons[idx].args : NULL,
-                                     workDir, SW_SHOW);
+                                     exPath, args, workDir, nShow);
                 if ((INT_PTR)hRet <= 32) {
                     char errmsg[512];
                     snprintf(errmsg, sizeof(errmsg),
                              "Failed to launch:\n%s\n\nError code: %d",
-                             g_buttons[idx].path, (int)(INT_PTR)hRet);
+                             exPath, (int)(INT_PTR)hRet);
                     MessageBox(hwnd, errmsg, "Launch Error", MB_OK | MB_ICONWARNING);
                 }
             }
@@ -1538,7 +1822,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
 {
     g_hInst = hInstance;
-    GetIniPath();
+    InitCommonControls();   /* required to register TOOLTIPS_CLASS and other common controls */
+    GetBasePath();
+    ScanProfiles();
     LoadSettings();
     LoadButtons();
     RecreateFont();
@@ -1556,6 +1842,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     wcd.lpfnWndProc  = InfoDlgProc;     wcd.lpszClassName = "InfoDlgClass";     RegisterClass(&wcd);
     wcd.lpfnWndProc  = SettingsDlgProc; wcd.lpszClassName = "SettingsDlgClass"; RegisterClass(&wcd);
     wcd.lpfnWndProc  = AddDlgProc;      wcd.lpszClassName = "AddDlgClass";      RegisterClass(&wcd);
+    wcd.lpfnWndProc  = PromptDlgProc;   wcd.lpszClassName = "PromptDlgClass";   RegisterClass(&wcd);
 
     WNDCLASSEX wc = {0};
     wc.cbSize        = sizeof(WNDCLASSEX);
