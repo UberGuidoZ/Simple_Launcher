@@ -1,4 +1,4 @@
-# Simple_Launcher
+# Simple Launcher
 Simple Launcher shows a configurable list of buttons. Click a button to launch the program or file assigned to it.
 
 Features:
