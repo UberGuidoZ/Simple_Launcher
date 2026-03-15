@@ -13,9 +13,9 @@ Features:
  * Tooltips showing path, args, and working directory on hover
  * Working directory field per button
  * Open INI in Notepad from menu bar
- * Categories — collapsible group headers to organise buttons
- * Search / filter bar — type to instantly filter buttons by name
- * Compact mode — icon-only grid palette for a tiny always-on-top layout
+ * Categories - collapsible group headers to organise buttons
+ * Search / filter bar - type to instantly filter buttons by name
+ * Compact mode - icon-only grid palette for a tiny always-on-top layout
  * Open file location from right-click context menu
 
 ![Example use](https://raw.githubusercontent.com/UberGuidoZ/Simple_Launcher/refs/heads/main/Documentation/05-Example_Use.gif)
