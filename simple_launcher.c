@@ -1,5 +1,5 @@
 /*
- * simple_launcher.c - Simple Launcher v1.91
+ * simple_launcher.c - Simple Launcher v1.95
  *
  * Features:
  *   - INI-configured buttons with optional icons, separators, admin elevation
@@ -13,7 +13,11 @@
  *   - Tooltips showing path, args, and working directory on hover
  *   - Working directory field per button
  *   - Open INI in Notepad from menu bar
- *   - Version 1.91
+ *   - Categories — collapsible group headers to organise buttons
+ *   - Search / filter bar — type to instantly filter buttons by name
+ *   - Compact mode — icon-only grid palette for a tiny always-on-top layout
+ *   - Open file location from right-click context menu
+ *   - Version 1.95
  *
  * Compile:
  *
@@ -42,6 +46,8 @@ static void SetTitleBarDark(HWND hwnd, int dark);
 #define ID_BUTTON_BASE        100
 #define MAX_BUTTONS           64
 #define IDI_APPICON           200
+#define COMPACT_BTN_SZ        28
+#define COMPACT_BTN_GAP       4
 
 /* Dialog controls */
 #define IDC_NAME_EDIT         10
@@ -67,6 +73,9 @@ static void SetTitleBarDark(HWND hwnd, int dark);
 #define IDC_TITLE_EDIT        40
 #define IDC_WORKDIR_EDIT      41
 #define IDC_WORKDIR_BROWSE    42
+#define IDC_COMPACT_CHECK     45
+#define IDC_CAT_CHECK         46
+#define IDC_SEARCH_EDIT       60
 
 /* Menu IDs */
 #define ID_HELP_INSTRUCTIONS  20
@@ -80,6 +89,7 @@ static void SetTitleBarDark(HWND hwnd, int dark);
 #define IDM_EDIT_BTN          302
 #define IDM_DELETE_BTN        303
 #define IDM_DUPLICATE_BTN     304
+#define IDM_OPEN_LOCATION     305
 
 /* System tray */
 #define WM_TRAYICON           (WM_APP + 1)
@@ -97,6 +107,11 @@ static void SetTitleBarDark(HWND hwnd, int dark);
 #define DK_MENU_HOT RGB( 55,  55,  55)
 #define DK_SEP      RGB( 70,  70,  70)
 #define LT_SEP      RGB(160, 160, 160)
+#define DK_SEARCH   RGB( 40,  40,  40)
+#define DK_CAT_BG   RGB( 50,  75, 110)   /* category header — dark mode */
+#define LT_CAT_BG   RGB(200, 220, 245)   /* category header — light mode */
+#define DK_CAT_TEXT RGB(200, 225, 255)
+#define LT_CAT_TEXT RGB( 20,  50, 100)
 
 static const char *g_menuLabels[] = { "Instructions", "Settings", "Open INI", "About" };
 static const UINT  g_menuIDs[]    = { ID_HELP_INSTRUCTIONS, ID_SETTINGS, ID_OPEN_INI, ID_HELP_ABOUT };
@@ -110,12 +125,14 @@ typedef struct {
     char iconPath[MAX_PATH];  /* custom icon file, or empty = use target .exe */
     int  admin;
     int  isSeparator;
+    int  isCategory;    /* collapsible group header */
     int  showIcon;
 } ButtonConfig;
 
 static ButtonConfig g_buttons[MAX_BUTTONS];
 static HICON        g_icons[MAX_BUTTONS];
 static int          g_count        = 0;
+static int          g_collapsed[MAX_BUTTONS]; /* 1 = category is collapsed */
 
 /* Settings */
 static int          g_darkMode     = 0;
@@ -123,6 +140,7 @@ static int          g_alwaysOnTop  = 0;
 static int          g_minToTray    = 0;
 static int          g_fontSize     = 9;
 static int          g_winWidth     = 300;
+static int          g_compactMode  = 0;
 static COLORREF     g_adminColor   = RGB(200, 0, 0);
 static int          g_winX         = -1;
 static int          g_winY         = -1;
@@ -136,12 +154,16 @@ static HINSTANCE    g_hInst;
 static char         g_iniPath[MAX_PATH];
 static HWND         g_hwndDlg      = NULL;
 static HBRUSH       g_hbrDkBg      = NULL;
+static HBRUSH       g_hbrSearchDk  = NULL;
 static HFONT        g_hFont        = NULL;
+static HFONT        g_hFontBold    = NULL;   /* bold font for category headers */
 static int          g_trayAdded    = 0;
 static int          g_editIndex    = -1;
 static int          g_ctxIndex     = -1;
 static COLORREF     g_settingColor;
 static COLORREF     g_customColors[16];
+static HWND         g_hwndSearch   = NULL;
+static char         g_filterText[256] = "";
 
 static const char  *g_infoDlgTitle   = NULL;
 static const char  *g_infoDlgContent = NULL;
@@ -173,11 +195,15 @@ static void ApplyOpacity(void)
 }
 static void RecreateFont(void)
 {
-    if (g_hFont) { DeleteObject(g_hFont); g_hFont = NULL; }
+    if (g_hFont)     { DeleteObject(g_hFont);     g_hFont     = NULL; }
+    if (g_hFontBold) { DeleteObject(g_hFontBold); g_hFontBold = NULL; }
     HDC hdc = GetDC(NULL);
     int h = -MulDiv(g_fontSize, GetDeviceCaps(hdc, LOGPIXELSY), 72);
     ReleaseDC(NULL, hdc);
     g_hFont = CreateFont(h, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+    g_hFontBold = CreateFont(h, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                          CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
 }
@@ -237,6 +263,7 @@ static void LoadSettings(void)
     g_winX        = GetPrivateProfileInt("Settings", "WindowX",          -1,             g_iniPath);
     g_winY        = GetPrivateProfileInt("Settings", "WindowY",          -1,             g_iniPath);
     g_opacity     = GetPrivateProfileInt("Settings", "Opacity",          100,            g_iniPath);
+    g_compactMode = GetPrivateProfileInt("Settings", "CompactMode",      0,              g_iniPath);
     GetPrivateProfileString("Settings", "WindowTitle", "Simple Launcher",
                             g_winTitle, sizeof(g_winTitle), g_iniPath);
     if (g_fontSize < 6)   g_fontSize = 6;
@@ -272,9 +299,11 @@ static void LoadButtons(void)
         GetPrivateProfileString(sec, "Args",     "", g_buttons[i].args,     512,      g_iniPath);
         GetPrivateProfileString(sec, "WorkDir",  "", g_buttons[i].workDir,  MAX_PATH, g_iniPath);
         GetPrivateProfileString(sec, "IconPath", "", g_buttons[i].iconPath, MAX_PATH, g_iniPath);
-        g_buttons[i].admin       = GetPrivateProfileInt(sec, "Admin",     0, g_iniPath);
-        g_buttons[i].isSeparator = GetPrivateProfileInt(sec, "Separator", 0, g_iniPath);
-        g_buttons[i].showIcon    = GetPrivateProfileInt(sec, "ShowIcon",  0, g_iniPath);
+        g_buttons[i].admin       = GetPrivateProfileInt(sec, "Admin",      0, g_iniPath);
+        g_buttons[i].isSeparator = GetPrivateProfileInt(sec, "Separator",  0, g_iniPath);
+        g_buttons[i].isCategory  = GetPrivateProfileInt(sec, "IsCategory", 0, g_iniPath);
+        g_buttons[i].showIcon    = GetPrivateProfileInt(sec, "ShowIcon",   0, g_iniPath);
+        g_collapsed[i] = 0;
     }
 }
 
@@ -298,6 +327,7 @@ static void SaveAll(void)
     fprintf(f, "WindowX=%d\r\n",          g_winX);
     fprintf(f, "WindowY=%d\r\n",          g_winY);
     fprintf(f, "Opacity=%d\r\n",          g_opacity);
+    fprintf(f, "CompactMode=%d\r\n",      g_compactMode);
     fprintf(f, "WindowTitle=%s\r\n",      g_winTitle);
     fprintf(f, "\r\n");
     fprintf(f, "[Buttons]\r\n");
@@ -310,9 +340,10 @@ static void SaveAll(void)
         fprintf(f, "Args=%s\r\n",      g_buttons[i].args);
         fprintf(f, "WorkDir=%s\r\n",   g_buttons[i].workDir);
         fprintf(f, "IconPath=%s\r\n",  g_buttons[i].iconPath);
-        fprintf(f, "Admin=%d\r\n",     g_buttons[i].admin);
-        fprintf(f, "Separator=%d\r\n", g_buttons[i].isSeparator);
-        fprintf(f, "ShowIcon=%d\r\n",  g_buttons[i].showIcon);
+        fprintf(f, "Admin=%d\r\n",      g_buttons[i].admin);
+        fprintf(f, "Separator=%d\r\n",  g_buttons[i].isSeparator);
+        fprintf(f, "IsCategory=%d\r\n", g_buttons[i].isCategory);
+        fprintf(f, "ShowIcon=%d\r\n",   g_buttons[i].showIcon);
     }
     fclose(f);
 }
@@ -351,58 +382,95 @@ static void LoadButtonIcons(void)
 /* ── Owner-draw ──────────────────────────────────────────────────────── */
 static void DrawButton(LPDRAWITEMSTRUCT dis, int idx)
 {
-    /* ── separator ── */
+    RECT rc = dis->rcItem;
+    BOOL pressed = (dis->itemState & ODS_SELECTED);
+
+    /* ── Compact tile (non-Add) ── */
+    if (g_compactMode && idx >= 0) {
+        if (g_darkMode) {
+            HBRUSH hbr = CreateSolidBrush(pressed ? DK_BTN_PRE : DK_BTN);
+            FillRect(dis->hDC, &rc, hbr); DeleteObject(hbr);
+            HPEN hp = CreatePen(PS_SOLID, 1, DK_BORDER);
+            HPEN hop = (HPEN)SelectObject(dis->hDC, hp);
+            HBRUSH hn = (HBRUSH)SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
+            Rectangle(dis->hDC, rc.left, rc.top, rc.right, rc.bottom);
+            SelectObject(dis->hDC, hop); SelectObject(dis->hDC, hn); DeleteObject(hp);
+        } else {
+            FillRect(dis->hDC, &rc, (HBRUSH)(COLOR_BTNFACE + 1));
+            DrawEdge(dis->hDC, &rc, pressed ? EDGE_SUNKEN : EDGE_RAISED, BF_RECT);
+        }
+        int sz = 16;
+        int ix = rc.left + (rc.right  - rc.left - sz) / 2;
+        int iy = rc.top  + (rc.bottom - rc.top  - sz) / 2;
+        if (idx < g_count && g_icons[idx]) {
+            DrawIconEx(dis->hDC, ix, iy, g_icons[idx], sz, sz, 0, NULL, DI_NORMAL);
+        } else if (idx < g_count && g_buttons[idx].name[0]) {
+            char letter[2] = { (char)toupper((unsigned char)g_buttons[idx].name[0]), '\0' };
+            SetBkMode(dis->hDC, TRANSPARENT);
+            SetTextColor(dis->hDC, g_darkMode ? DK_TEXT : GetSysColor(COLOR_BTNTEXT));
+            HFONT hof = g_hFont ? (HFONT)SelectObject(dis->hDC, g_hFont) : NULL;
+            DrawText(dis->hDC, letter, 1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            if (hof) SelectObject(dis->hDC, hof);
+        }
+        if (dis->itemState & ODS_FOCUS) DrawFocusRect(dis->hDC, &rc);
+        return;
+    }
+
+    /* ── Category header ── */
+    if (idx >= 0 && idx < g_count && g_buttons[idx].isCategory) {
+        COLORREF bg   = g_darkMode ? DK_CAT_BG  : LT_CAT_BG;
+        COLORREF text = g_darkMode ? DK_CAT_TEXT : LT_CAT_TEXT;
+        HBRUSH hbr = CreateSolidBrush(pressed ? (g_darkMode ? DK_BTN_PRE : RGB(180,205,235)) : bg);
+        FillRect(dis->hDC, &rc, hbr); DeleteObject(hbr);
+        const char *arrow = g_collapsed[idx] ? ">" : "v";
+        SetBkMode(dis->hDC, TRANSPARENT);
+        SetTextColor(dis->hDC, text);
+        HFONT hof = g_hFontBold ? (HFONT)SelectObject(dis->hDC, g_hFontBold) : NULL;
+        RECT arrowRc = { rc.left + 6, rc.top, rc.left + 20, rc.bottom };
+        DrawText(dis->hDC, arrow, -1, &arrowRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        RECT textRc  = { rc.left + 22, rc.top, rc.right - 4, rc.bottom };
+        DrawText(dis->hDC, g_buttons[idx].name, -1, &textRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        if (hof) SelectObject(dis->hDC, hof);
+        if (dis->itemState & ODS_FOCUS) DrawFocusRect(dis->hDC, &rc);
+        return;
+    }
+
+    /* ── Separator ── */
     if (idx >= 0 && idx < g_count && g_buttons[idx].isSeparator) {
-        RECT rc = dis->rcItem;
         COLORREF bgCol = g_darkMode ? DK_BG : GetSysColor(COLOR_BTNFACE);
         HBRUSH hbr = CreateSolidBrush(bgCol);
-        FillRect(dis->hDC, &rc, hbr);
-        DeleteObject(hbr);
+        FillRect(dis->hDC, &rc, hbr); DeleteObject(hbr);
         int midY = (rc.top + rc.bottom) / 2;
         HPEN hPen = CreatePen(PS_SOLID, 1, g_darkMode ? DK_SEP : LT_SEP);
         HPEN hOld = (HPEN)SelectObject(dis->hDC, hPen);
         MoveToEx(dis->hDC, rc.left + 6, midY, NULL);
         LineTo(dis->hDC,   rc.right - 6, midY);
-        SelectObject(dis->hDC, hOld);
-        DeleteObject(hPen);
+        SelectObject(dis->hDC, hOld); DeleteObject(hPen);
         return;
     }
 
-    /* ── normal button ── */
-    RECT rc      = dis->rcItem;
-    BOOL pressed = (dis->itemState & ODS_SELECTED);
-    int  isAdmin = (idx >= 0 && idx < g_count) ? g_buttons[idx].admin : 0;
-
-    /* background */
+    /* ── Normal button ── */
+    int isAdmin = (idx >= 0 && idx < g_count) ? g_buttons[idx].admin : 0;
     if (g_darkMode) {
         HBRUSH hbr = CreateSolidBrush(pressed ? DK_BTN_PRE : DK_BTN);
-        FillRect(dis->hDC, &rc, hbr);
-        DeleteObject(hbr);
+        FillRect(dis->hDC, &rc, hbr); DeleteObject(hbr);
         HPEN   hPen  = CreatePen(PS_SOLID, 1, DK_BORDER);
         HPEN   hOldP = (HPEN)SelectObject(dis->hDC, hPen);
         HBRUSH hNull = (HBRUSH)SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
         Rectangle(dis->hDC, rc.left, rc.top, rc.right, rc.bottom);
-        SelectObject(dis->hDC, hOldP);
-        SelectObject(dis->hDC, hNull);
-        DeleteObject(hPen);
+        SelectObject(dis->hDC, hOldP); SelectObject(dis->hDC, hNull); DeleteObject(hPen);
     } else {
         FillRect(dis->hDC, &rc, (HBRUSH)(COLOR_BTNFACE + 1));
         DrawEdge(dis->hDC, &rc, pressed ? EDGE_SUNKEN : EDGE_RAISED, BF_RECT);
     }
-
-    /* admin/custom color border */
     if (isAdmin) {
         HPEN   hPen  = CreatePen(PS_SOLID, 2, g_adminColor);
         HPEN   hOldP = (HPEN)SelectObject(dis->hDC, hPen);
         HBRUSH hNull = (HBRUSH)SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
         RECT   inner = { rc.left+3, rc.top+3, rc.right-3, rc.bottom-3 };
         Rectangle(dis->hDC, inner.left, inner.top, inner.right, inner.bottom);
-        SelectObject(dis->hDC, hOldP);
-        SelectObject(dis->hDC, hNull);
-        DeleteObject(hPen);
+        SelectObject(dis->hDC, hOldP); SelectObject(dis->hDC, hNull); DeleteObject(hPen);
     }
-
-    /* icon */
     int textLeft = rc.left;
     if (idx >= 0 && idx < g_count && g_icons[idx]) {
         int sz = 16, ix = rc.left + 6;
@@ -410,12 +478,9 @@ static void DrawButton(LPDRAWITEMSTRUCT dis, int idx)
         DrawIconEx(dis->hDC, ix, iy, g_icons[idx], sz, sz, 0, NULL, DI_NORMAL);
         textLeft = ix + sz + 4;
     }
-
-    /* label */
     SetBkMode(dis->hDC, TRANSPARENT);
     SetTextColor(dis->hDC, g_darkMode ? DK_TEXT : GetSysColor(COLOR_BTNTEXT));
-    HFONT hOldFont = NULL;
-    if (g_hFont) hOldFont = (HFONT)SelectObject(dis->hDC, g_hFont);
+    HFONT hOldFont = g_hFont ? (HFONT)SelectObject(dis->hDC, g_hFont) : NULL;
     RECT textRc = { textLeft, rc.top, rc.right, rc.bottom };
     if (pressed) OffsetRect(&textRc, 1, 1);
     const char *label = (idx == -1) ? "+ Add Button" :
@@ -428,8 +493,13 @@ static void DrawButton(LPDRAWITEMSTRUCT dis, int idx)
 /* ── Dark background ─────────────────────────────────────────────────── */
 static void ApplyDarkBackground(void)
 {
-    if (g_hbrDkBg) { DeleteObject(g_hbrDkBg); g_hbrDkBg = NULL; }
-    if (g_darkMode) g_hbrDkBg = CreateSolidBrush(DK_BG);
+    if (g_hbrDkBg)     { DeleteObject(g_hbrDkBg);     g_hbrDkBg     = NULL; }
+    if (g_hbrSearchDk) { DeleteObject(g_hbrSearchDk); g_hbrSearchDk = NULL; }
+    if (g_darkMode) {
+        g_hbrDkBg     = CreateSolidBrush(DK_BG);
+        g_hbrSearchDk = CreateSolidBrush(DK_SEARCH);
+    }
+    if (g_hwndSearch) InvalidateRect(g_hwndSearch, NULL, TRUE);
 }
 
 /* ── Menu ────────────────────────────────────────────────────────────── */
@@ -449,6 +519,21 @@ static void RebuildMenu(void)
     DrawMenuBar(g_hwndMain);
 }
 
+/* ── Filter helper ───────────────────────────────────────────────────── */
+static int ButtonMatchesFilter(int i)
+{
+    if (!g_filterText[0]) return 1;
+    if (g_buttons[i].isSeparator || g_buttons[i].isCategory) return 0;
+    char hay[256], ndl[256]; int hi = 0, ni = 0;
+    for (const char *p = g_buttons[i].name; *p && hi < 255; p++)
+        hay[hi++] = (char)tolower((unsigned char)*p);
+    hay[hi] = '\0';
+    for (const char *p = g_filterText; *p && ni < 255; p++)
+        ndl[ni++] = (char)tolower((unsigned char)*p);
+    ndl[ni] = '\0';
+    return (strstr(hay, ndl) != NULL) ? 1 : 0;
+}
+
 /* ── Layout ──────────────────────────────────────────────────────────── */
 static void RefreshMainWindow(void)
 {
@@ -458,17 +543,79 @@ static void RefreshMainWindow(void)
     if (g_hwndTooltip) { DestroyWindow(g_hwndTooltip); g_hwndTooltip = NULL; }
 
     int btnW = g_winWidth - 20;
-    int y    = 10;
-    for (int i = 0; i < g_count; i++) {
-        int h = g_buttons[i].isSeparator ? 14 : 26;
-        DWORD style = WS_VISIBLE | WS_CHILD | BS_OWNERDRAW;
-        /* separators: NOT disabled so right-click still fires WM_CONTEXTMENU */
-        g_hwndBtns[i] = CreateWindow("BUTTON", g_buttons[i].name, style,
-                                     10, y, btnW, h, g_hwndMain,
-                                     (HMENU)(UINT_PTR)(ID_BUTTON_BASE + i), g_hInst, NULL);
-        if (g_hFont) SendMessage(g_hwndBtns[i], WM_SETFONT, (WPARAM)g_hFont, FALSE);
-        y += h + 5;
+
+    /* Search bar — always visible */
+    if (!g_hwndSearch) {
+        g_hwndSearch = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "",
+            WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL,
+            10, 10, btnW, 22, g_hwndMain, (HMENU)IDC_SEARCH_EDIT, g_hInst, NULL);
+        SendMessage(g_hwndSearch, EM_SETCUEBANNER, FALSE, (LPARAM)L"Search\u2026");
+        if (g_hFont) SendMessage(g_hwndSearch, WM_SETFONT, (WPARAM)g_hFont, FALSE);
+    } else {
+        SetWindowPos(g_hwndSearch, HWND_TOP, 10, 10, btnW, 22, SWP_SHOWWINDOW);
+        if (g_hFont) SendMessage(g_hwndSearch, WM_SETFONT, (WPARAM)g_hFont, FALSE);
     }
+
+    int y = 10 + 22 + 6;   /* below search bar */
+
+    if (g_compactMode) {
+        /* ── Compact grid — icon tiles, no labels, skip separators+categories ── */
+        int sz = COMPACT_BTN_SZ, gap = COMPACT_BTN_GAP;
+        int cols = (btnW + gap) / (sz + gap);
+        if (cols < 1) cols = 1;
+        int col = 0;
+        for (int i = 0; i < g_count; i++) {
+            if (g_buttons[i].isSeparator || g_buttons[i].isCategory) continue;
+            int bx = 10 + col * (sz + gap);
+            g_hwndBtns[i] = CreateWindow("BUTTON", g_buttons[i].name,
+                WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, bx, y, sz, sz,
+                g_hwndMain, (HMENU)(UINT_PTR)(ID_BUTTON_BASE + i), g_hInst, NULL);
+            if (g_hFont) SendMessage(g_hwndBtns[i], WM_SETFONT, (WPARAM)g_hFont, FALSE);
+            col++;
+            if (col >= cols) { col = 0; y += sz + gap; }
+        }
+        if (col > 0) y += sz + gap;
+
+    } else if (g_filterText[0]) {
+        /* ── Flat filtered list — skip category structure ── */
+        for (int i = 0; i < g_count; i++) {
+            if (!ButtonMatchesFilter(i)) continue;
+            g_hwndBtns[i] = CreateWindow("BUTTON", g_buttons[i].name,
+                WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 10, y, btnW, 26,
+                g_hwndMain, (HMENU)(UINT_PTR)(ID_BUTTON_BASE + i), g_hInst, NULL);
+            if (g_hFont) SendMessage(g_hwndBtns[i], WM_SETFONT, (WPARAM)g_hFont, FALSE);
+            y += 26 + 5;
+        }
+
+    } else {
+        /* ── Full list with categories and separators ── */
+        int catCollapsed = 0;
+        for (int i = 0; i < g_count; i++) {
+            if (g_buttons[i].isCategory) {
+                catCollapsed = g_collapsed[i];
+                int h = 24;
+                g_hwndBtns[i] = CreateWindow("BUTTON", g_buttons[i].name,
+                    WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 10, y, btnW, h,
+                    g_hwndMain, (HMENU)(UINT_PTR)(ID_BUTTON_BASE + i), g_hInst, NULL);
+                if (g_hFontBold) SendMessage(g_hwndBtns[i], WM_SETFONT, (WPARAM)g_hFontBold, FALSE);
+                y += h + 3;
+            } else if (catCollapsed) {
+                continue;
+            } else if (g_buttons[i].isSeparator) {
+                g_hwndBtns[i] = CreateWindow("BUTTON", "", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
+                    10, y, btnW, 14, g_hwndMain,
+                    (HMENU)(UINT_PTR)(ID_BUTTON_BASE + i), g_hInst, NULL);
+                y += 14 + 5;
+            } else {
+                g_hwndBtns[i] = CreateWindow("BUTTON", g_buttons[i].name,
+                    WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 10, y, btnW, 26,
+                    g_hwndMain, (HMENU)(UINT_PTR)(ID_BUTTON_BASE + i), g_hInst, NULL);
+                if (g_hFont) SendMessage(g_hwndBtns[i], WM_SETFONT, (WPARAM)g_hFont, FALSE);
+                y += 26 + 5;
+            }
+        }
+    }
+
     HWND hAdd = GetDlgItem(g_hwndMain, ID_ADD_BTN);
     SetWindowLongPtr(hAdd, GWL_STYLE, WS_VISIBLE | WS_CHILD | BS_OWNERDRAW);
     SetWindowPos(hAdd, HWND_TOP, 10, y, btnW, 26, SWP_SHOWWINDOW | SWP_FRAMECHANGED);
@@ -481,7 +628,7 @@ static void RefreshMainWindow(void)
                  rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER);
     InvalidateRect(g_hwndMain, NULL, TRUE);
 
-    /* ── Tooltips: show path + args on hover ── */
+    /* ── Tooltips ── */
     g_hwndTooltip = CreateWindowEx(WS_EX_TOPMOST, TOOLTIPS_CLASS, NULL,
         WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
         CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -491,21 +638,23 @@ static void RefreshMainWindow(void)
         SendMessage(g_hwndTooltip, TTM_SETDELAYTIME, TTDT_INITIAL, 500);
         for (int i = 0; i < g_count; i++) {
             if (!g_hwndBtns[i] || g_buttons[i].isSeparator) continue;
-            /* Build tip: path, optional args, optional workdir */
             char *tip = g_tooltipText[i];
             int pos = 0;
-            pos += snprintf(tip + pos, sizeof(g_tooltipText[i]) - pos,
-                            "%s", g_buttons[i].path);
-            if (g_buttons[i].args[0])
+            if (g_buttons[i].isCategory) {
+                snprintf(tip, sizeof(g_tooltipText[i]), "Category: %s", g_buttons[i].name);
+            } else {
                 pos += snprintf(tip + pos, sizeof(g_tooltipText[i]) - pos,
-                                "\nArgs: %s", g_buttons[i].args);
-            if (g_buttons[i].workDir[0])
-                pos += snprintf(tip + pos, sizeof(g_tooltipText[i]) - pos,
-                                "\nDir:  %s", g_buttons[i].workDir);
-            if (g_buttons[i].admin)
-                snprintf(tip + pos, sizeof(g_tooltipText[i]) - pos,
-                         "\n[Run as Administrator]");
-
+                                "%s", g_buttons[i].path);
+                if (g_buttons[i].args[0])
+                    pos += snprintf(tip + pos, sizeof(g_tooltipText[i]) - pos,
+                                    "\nArgs: %s", g_buttons[i].args);
+                if (g_buttons[i].workDir[0])
+                    pos += snprintf(tip + pos, sizeof(g_tooltipText[i]) - pos,
+                                    "\nDir:  %s", g_buttons[i].workDir);
+                if (g_buttons[i].admin)
+                    snprintf(tip + pos, sizeof(g_tooltipText[i]) - pos,
+                             "\n[Run as Administrator]");
+            }
             TOOLINFO ti; ZeroMemory(&ti, sizeof(ti));
             ti.cbSize   = sizeof(TOOLINFO);
             ti.uFlags   = TTF_IDISHWND | TTF_SUBCLASS;
@@ -526,10 +675,12 @@ static void ShowButtonContextMenu(HWND hwnd, int idx, POINT pt)
     AppendMenu(hMenu, MF_STRING | (idx == g_count - 1 ? MF_GRAYED : 0),
                IDM_MOVE_DOWN, "Move Down");
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
-    if (!g_buttons[idx].isSeparator)
+    if (!g_buttons[idx].isSeparator && !g_buttons[idx].isCategory)
         AppendMenu(hMenu, MF_STRING, IDM_EDIT_BTN, "Edit...");
     AppendMenu(hMenu, MF_STRING | (g_count >= MAX_BUTTONS ? MF_GRAYED : 0),
                IDM_DUPLICATE_BTN, "Duplicate");
+    if (!g_buttons[idx].isSeparator && !g_buttons[idx].isCategory && g_buttons[idx].path[0])
+        AppendMenu(hMenu, MF_STRING, IDM_OPEN_LOCATION, "Open File Location");
     AppendMenu(hMenu, MF_STRING, IDM_DELETE_BTN, "Delete");
     SetForegroundWindow(hwnd);
     TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
@@ -624,25 +775,29 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                      10, 206, 200, 20, hwnd, (HMENU)IDC_TRAY_CHECK, g_hInst, NULL);
         SendDlgItemMessage(hwnd, IDC_TRAY_CHECK, BM_SETCHECK,
                            g_minToTray ? BST_CHECKED : BST_UNCHECKED, 0);
+        CreateWindow("BUTTON", "Compact mode (icon grid, no labels)", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX,
+                     10, 230, 255, 20, hwnd, (HMENU)IDC_COMPACT_CHECK, g_hInst, NULL);
+        SendDlgItemMessage(hwnd, IDC_COMPACT_CHECK, BM_SETCHECK,
+                           g_compactMode ? BST_CHECKED : BST_UNCHECKED, 0);
         /* ── Window ── */
         CreateWindow("STATIC", "Window", WS_VISIBLE|WS_CHILD,
-                     10, 237, 200, 16, hwnd, NULL, g_hInst, NULL);
+                     10, 260, 200, 16, hwnd, NULL, g_hInst, NULL);
         CreateWindow("STATIC", "Title:", WS_VISIBLE|WS_CHILD,
-                     10, 257, 40, 18, hwnd, NULL, g_hInst, NULL);
+                     10, 280, 40, 18, hwnd, NULL, g_hInst, NULL);
         CreateWindow("EDIT", g_winTitle, WS_VISIBLE|WS_CHILD|WS_BORDER|ES_AUTOHSCROLL,
-                     55, 255, 220, 20, hwnd, (HMENU)IDC_TITLE_EDIT, g_hInst, NULL);
+                     55, 278, 220, 20, hwnd, (HMENU)IDC_TITLE_EDIT, g_hInst, NULL);
         CreateWindow("STATIC", "Opacity:", WS_VISIBLE|WS_CHILD,
-                     10, 283, 55, 18, hwnd, NULL, g_hInst, NULL);
+                     10, 306, 55, 18, hwnd, NULL, g_hInst, NULL);
         { char buf[8]; sprintf(buf, "%d", g_opacity);
           CreateWindow("EDIT", buf, WS_VISIBLE|WS_CHILD|WS_BORDER|ES_NUMBER,
-                       70, 281, 40, 20, hwnd, (HMENU)IDC_OPACITY_EDIT, g_hInst, NULL); }
+                       70, 304, 40, 20, hwnd, (HMENU)IDC_OPACITY_EDIT, g_hInst, NULL); }
         CreateWindow("STATIC", "% (10-100)", WS_VISIBLE|WS_CHILD,
-                     115, 283, 75, 18, hwnd, NULL, g_hInst, NULL);
+                     115, 306, 75, 18, hwnd, NULL, g_hInst, NULL);
         /* ── Buttons ── */
         CreateWindow("BUTTON", "Save",   WS_VISIBLE|WS_CHILD|BS_DEFPUSHBUTTON,
-                     108, 314, 80, 26, hwnd, (HMENU)IDC_OK,     g_hInst, NULL);
+                     108, 338, 80, 26, hwnd, (HMENU)IDC_OK,     g_hInst, NULL);
         CreateWindow("BUTTON", "Cancel", WS_VISIBLE|WS_CHILD|BS_PUSHBUTTON,
-                     198, 314, 80, 26, hwnd, (HMENU)IDC_CANCEL, g_hInst, NULL);
+                     198, 338, 80, 26, hwnd, (HMENU)IDC_CANCEL, g_hInst, NULL);
         return 0;
 
     case WM_COMMAND:
@@ -664,6 +819,7 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             int newDark    = (SendDlgItemMessage(hwnd, IDC_DARK_CHECK,    BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
             int newTopmost = (SendDlgItemMessage(hwnd, IDC_TOPMOST_CHECK, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
             int newTray    = (SendDlgItemMessage(hwnd, IDC_TRAY_CHECK,    BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+            int newCompact = (SendDlgItemMessage(hwnd, IDC_COMPACT_CHECK, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
             char buf[256];
             GetDlgItemText(hwnd, IDC_FONT_EDIT,  buf, 16);
             int newFont = atoi(buf); if (newFont < 6) newFont = 6; if (newFont > 72) newFont = 72;
@@ -689,6 +845,7 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                              0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             }
             g_minToTray = newTray;
+            if (newCompact != g_compactMode) { g_compactMode = newCompact; needRefresh = 1; }
             if (g_settingColor != g_adminColor) { g_adminColor = g_settingColor; needRefresh = 1; }
             if (newFont    != g_fontSize)  { g_fontSize  = newFont;  RecreateFont(); needRefresh = 1; }
             if (newWidth   != g_winWidth)  { g_winWidth  = newWidth; needRefresh = 1; }
@@ -775,6 +932,9 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         CreateWindow("BUTTON", "Separator (divider line)",
                      WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX,
                      10, 328, 220, 20, hwnd, (HMENU)IDC_SEP_CHECK, g_hInst, NULL);
+        CreateWindow("BUTTON", "Category header (collapsible group)",
+                     WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX,
+                     10, 352, 255, 20, hwnd, (HMENU)IDC_CAT_CHECK, g_hInst, NULL);
         if (edit && bc->isSeparator) {
             SendDlgItemMessage(hwnd, IDC_SEP_CHECK, BM_SETCHECK, BST_CHECKED, 0);
             EnableWindow(GetDlgItem(hwnd, IDC_NAME_EDIT),       FALSE);
@@ -787,14 +947,28 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             EnableWindow(GetDlgItem(hwnd, IDC_ICON_CHECK),      FALSE);
             EnableWindow(GetDlgItem(hwnd, IDC_ICON_PATH_EDIT),  FALSE);
             EnableWindow(GetDlgItem(hwnd, IDC_ICON_BROWSE),     FALSE);
+            EnableWindow(GetDlgItem(hwnd, IDC_CAT_CHECK),       FALSE);
+        }
+        if (edit && bc->isCategory) {
+            SendDlgItemMessage(hwnd, IDC_CAT_CHECK, BM_SETCHECK, BST_CHECKED, 0);
+            EnableWindow(GetDlgItem(hwnd, IDC_PATH_EDIT),       FALSE);
+            EnableWindow(GetDlgItem(hwnd, IDC_ARGS_EDIT),       FALSE);
+            EnableWindow(GetDlgItem(hwnd, IDC_BROWSE),          FALSE);
+            EnableWindow(GetDlgItem(hwnd, IDC_WORKDIR_EDIT),    FALSE);
+            EnableWindow(GetDlgItem(hwnd, IDC_WORKDIR_BROWSE),  FALSE);
+            EnableWindow(GetDlgItem(hwnd, IDC_ADMIN_CHECK),     FALSE);
+            EnableWindow(GetDlgItem(hwnd, IDC_ICON_CHECK),      FALSE);
+            EnableWindow(GetDlgItem(hwnd, IDC_ICON_PATH_EDIT),  FALSE);
+            EnableWindow(GetDlgItem(hwnd, IDC_ICON_BROWSE),     FALSE);
+            EnableWindow(GetDlgItem(hwnd, IDC_SEP_CHECK),       FALSE);
         }
 
         CreateWindow("BUTTON", edit ? "Save" : "Add",
                      WS_VISIBLE|WS_CHILD|BS_DEFPUSHBUTTON,
-                     210, 362, 80, 28, hwnd, (HMENU)IDC_OK, g_hInst, NULL);
+                     210, 388, 80, 28, hwnd, (HMENU)IDC_OK, g_hInst, NULL);
         CreateWindow("BUTTON", "Cancel",
                      WS_VISIBLE|WS_CHILD|BS_PUSHBUTTON,
-                     300, 362, 80, 28, hwnd, (HMENU)IDC_CANCEL, g_hInst, NULL);
+                     300, 388, 80, 28, hwnd, (HMENU)IDC_CANCEL, g_hInst, NULL);
         return 0;
     }
 
@@ -802,6 +976,7 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         switch (LOWORD(wParam)) {
         case IDC_SEP_CHECK: {
             BOOL sep = (SendDlgItemMessage(hwnd, IDC_SEP_CHECK, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            if (sep) SendDlgItemMessage(hwnd, IDC_CAT_CHECK, BM_SETCHECK, BST_UNCHECKED, 0);
             EnableWindow(GetDlgItem(hwnd, IDC_NAME_EDIT),      !sep);
             EnableWindow(GetDlgItem(hwnd, IDC_PATH_EDIT),      !sep);
             EnableWindow(GetDlgItem(hwnd, IDC_ARGS_EDIT),      !sep);
@@ -812,6 +987,23 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             EnableWindow(GetDlgItem(hwnd, IDC_ICON_CHECK),     !sep);
             EnableWindow(GetDlgItem(hwnd, IDC_ICON_PATH_EDIT), !sep);
             EnableWindow(GetDlgItem(hwnd, IDC_ICON_BROWSE),    !sep);
+            EnableWindow(GetDlgItem(hwnd, IDC_CAT_CHECK),      !sep);
+            break;
+        }
+        case IDC_CAT_CHECK: {
+            BOOL cat = (SendDlgItemMessage(hwnd, IDC_CAT_CHECK, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            if (cat) SendDlgItemMessage(hwnd, IDC_SEP_CHECK, BM_SETCHECK, BST_UNCHECKED, 0);
+            /* Category only needs a name; disable path/args/icon/admin */
+            EnableWindow(GetDlgItem(hwnd, IDC_PATH_EDIT),      !cat);
+            EnableWindow(GetDlgItem(hwnd, IDC_ARGS_EDIT),      !cat);
+            EnableWindow(GetDlgItem(hwnd, IDC_BROWSE),         !cat);
+            EnableWindow(GetDlgItem(hwnd, IDC_WORKDIR_EDIT),   !cat);
+            EnableWindow(GetDlgItem(hwnd, IDC_WORKDIR_BROWSE), !cat);
+            EnableWindow(GetDlgItem(hwnd, IDC_ADMIN_CHECK),    !cat);
+            EnableWindow(GetDlgItem(hwnd, IDC_ICON_CHECK),     !cat);
+            EnableWindow(GetDlgItem(hwnd, IDC_ICON_PATH_EDIT), !cat);
+            EnableWindow(GetDlgItem(hwnd, IDC_ICON_BROWSE),    !cat);
+            EnableWindow(GetDlgItem(hwnd, IDC_SEP_CHECK),      !cat);
             break;
         }
         case IDC_ICON_BROWSE: {
@@ -857,12 +1049,17 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         }
         case IDC_OK: {
             int isSep = (SendDlgItemMessage(hwnd, IDC_SEP_CHECK, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+            int isCat = (SendDlgItemMessage(hwnd, IDC_CAT_CHECK, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
             char name[256], path[MAX_PATH], args[512];
             GetDlgItemText(hwnd, IDC_NAME_EDIT, name, 256);
             GetDlgItemText(hwnd, IDC_PATH_EDIT, path, MAX_PATH);
             GetDlgItemText(hwnd, IDC_ARGS_EDIT, args, 512);
-            if (!isSep && (!name[0] || !path[0])) {
+            if (!isSep && !isCat && (!name[0] || !path[0])) {
                 MessageBox(hwnd, "Name and Path are required.", "Missing info", MB_OK | MB_ICONWARNING);
+                break;
+            }
+            if (isCat && !name[0]) {
+                MessageBox(hwnd, "Please enter a category name.", "Missing info", MB_OK | MB_ICONWARNING);
                 break;
             }
             int ti = (g_editIndex >= 0) ? g_editIndex : g_count;
@@ -878,6 +1075,16 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 g_buttons[ti].iconPath[0] = 0;
                 g_buttons[ti].admin       = 0;
                 g_buttons[ti].showIcon    = 0;
+                g_buttons[ti].isCategory  = 0;
+            } else if (isCat) {
+                strcpy(g_buttons[ti].name, name);
+                g_buttons[ti].path[0]     = 0;
+                g_buttons[ti].args[0]     = 0;
+                g_buttons[ti].workDir[0]  = 0;
+                g_buttons[ti].iconPath[0] = 0;
+                g_buttons[ti].admin       = 0;
+                g_buttons[ti].showIcon    = 0;
+                g_buttons[ti].isCategory  = 1;
             } else {
                 char iconPath[MAX_PATH], workDir[MAX_PATH];
                 GetDlgItemText(hwnd, IDC_ICON_PATH_EDIT, iconPath, MAX_PATH);
@@ -889,6 +1096,7 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 strcpy(g_buttons[ti].iconPath, iconPath);
                 g_buttons[ti].admin    = (SendDlgItemMessage(hwnd, IDC_ADMIN_CHECK, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
                 g_buttons[ti].showIcon = (SendDlgItemMessage(hwnd, IDC_ICON_CHECK,  BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+                g_buttons[ti].isCategory = 0;
             }
             g_buttons[ti].isSeparator = isSep;
             if (g_editIndex < 0) g_count++;
@@ -994,6 +1202,17 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                      10, 10, g_winWidth - 20, 26,
                      hwnd, (HMENU)ID_ADD_BTN, g_hInst, NULL);
         return 0;
+
+    case WM_CTLCOLOREDIT: {
+        HWND hCtrl = (HWND)lParam;
+        if (g_darkMode && hCtrl == g_hwndSearch) {
+            HDC hdc = (HDC)wParam;
+            SetTextColor(hdc, DK_TEXT); SetBkColor(hdc, DK_SEARCH);
+            if (!g_hbrSearchDk) g_hbrSearchDk = CreateSolidBrush(DK_SEARCH);
+            return (LRESULT)g_hbrSearchDk;
+        }
+        return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
 
     case WM_CLOSE:
         if (g_minToTray) {
@@ -1104,6 +1323,14 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
     case WM_COMMAND: {
         int id = LOWORD(wParam);
+        int notif = HIWORD(wParam);
+
+        /* Search bar */
+        if (id == IDC_SEARCH_EDIT && notif == EN_CHANGE) {
+            GetWindowText(g_hwndSearch, g_filterText, sizeof(g_filterText));
+            RefreshMainWindow();
+            return 0;
+        }
 
         if (id == IDM_MOVE_UP && g_ctxIndex > 0) {
             ButtonConfig tmp = g_buttons[g_ctxIndex];
@@ -1128,7 +1355,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             g_editIndex = g_ctxIndex; g_ctxIndex = -1;
             g_hwndDlg = CreateWindowEx(WS_EX_DLGMODALFRAME, "AddDlgClass", "Edit Button",
                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                CW_USEDEFAULT, CW_USEDEFAULT, 400, 430,
+                CW_USEDEFAULT, CW_USEDEFAULT, 400, 460,
                 hwnd, NULL, g_hInst, NULL);
             SetTitleBarDark(g_hwndDlg, g_darkMode);
             ShowWindow(g_hwndDlg, SW_SHOW); UpdateWindow(g_hwndDlg);
@@ -1169,6 +1396,19 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             }
             g_ctxIndex = -1;
 
+        } else if (id == IDM_OPEN_LOCATION && g_ctxIndex >= 0) {
+            if (g_buttons[g_ctxIndex].path[0]) {
+                /* Extract directory from path and open in Explorer */
+                char dir[MAX_PATH];
+                strncpy(dir, g_buttons[g_ctxIndex].path, MAX_PATH - 1);
+                dir[MAX_PATH - 1] = '\0';
+                char *slash = strrchr(dir, '\\');
+                if (!slash) slash = strrchr(dir, '/');
+                if (slash) *slash = '\0';
+                ShellExecute(NULL, "explore", dir, NULL, NULL, SW_SHOW);
+            }
+            g_ctxIndex = -1;
+
         } else if (id == ID_OPEN_INI) {
             ShellExecute(NULL, "open", "notepad.exe", g_iniPath, NULL, SW_SHOW);
 
@@ -1187,33 +1427,37 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 "  - Run as administrator: triggers a UAC elevation prompt\r\n"
                 "  - Show icon from program: shows the .exe icon on the button\r\n"
                 "  - Separator: inserts a thin divider line instead of a button\r\n"
+                "  - Category header: inserts a collapsible group label\r\n"
+                "\r\n"
+                "CATEGORIES\r\n"
+                "Add a 'Category header' to group buttons under a labelled "
+                "collapsible section. Click the category bar to collapse or "
+                "expand the buttons beneath it.\r\n"
+                "\r\n"
+                "SEARCH / FILTER\r\n"
+                "Type in the search bar at the top to instantly filter buttons "
+                "by name. Category headers and separators are hidden while a "
+                "filter is active.\r\n"
+                "\r\n"
+                "COMPACT MODE\r\n"
+                "Enable in Settings for a small icon-grid palette. Each tile "
+                "shows the program icon or first letter. Hover for the full name.\r\n"
                 "\r\n"
                 "EDITING / DELETING / REORDERING\r\n"
-                "Right-click any button to open a context menu with options to "
-                "Edit, Duplicate, Delete, Move Up, or Move Down.\r\n"
+                "Right-click any button to: Edit, Duplicate, Open File Location, "
+                "Delete, Move Up, or Move Down.\r\n"
                 "\r\n"
                 "TOOLTIPS\r\n"
                 "Hover over any button to see its full path, arguments, and "
-                "working directory in a tooltip.\r\n"
+                "working directory.\r\n"
                 "\r\n"
                 "ADMIN BORDER COLOR\r\n"
-                "Buttons set to run as administrator display a colored border "
-                "as a visual reminder that UAC will be triggered. The color "
-                "can be customised in Settings.\r\n"
+                "Buttons set to run as administrator display a colored border. "
+                "The color can be customised in Settings.\r\n"
                 "\r\n"
                 "SETTINGS\r\n"
-                "Click 'Settings' in the menu bar to configure:\r\n"
-                "  - Dark mode\r\n"
-                "  - Admin border color (color picker)\r\n"
-                "  - Font size\r\n"
-                "  - Window width\r\n"
-                "  - Always on top\r\n"
-                "  - Minimize to system tray\r\n"
-                "\r\n"
-                "SYSTEM TRAY\r\n"
-                "When 'Minimize to system tray' is on, closing the window hides "
-                "it. Double-click the tray icon to restore, or right-click for "
-                "Restore / Exit.\r\n"
+                "Dark mode, admin border color, font size, window width, "
+                "always on top, minimize to tray, compact mode, title, opacity.\r\n"
                 "\r\n"
                 "CONFIGURATION FILE\r\n"
                 "All settings are saved automatically to launcher.ini in the "
@@ -1224,7 +1468,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             if (g_hwndDlg) { SetForegroundWindow(g_hwndDlg); break; }
             g_hwndDlg = CreateWindowEx(WS_EX_DLGMODALFRAME, "SettingsDlgClass", "Settings",
                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                CW_USEDEFAULT, CW_USEDEFAULT, 295, 385,
+                CW_USEDEFAULT, CW_USEDEFAULT, 295, 410,
                 hwnd, NULL, g_hInst, NULL);
             SetTitleBarDark(g_hwndDlg, g_darkMode);
             ShowWindow(g_hwndDlg, SW_SHOW); UpdateWindow(g_hwndDlg);
@@ -1232,7 +1476,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         } else if (id == ID_HELP_ABOUT) {
             ShowInfoDialog(hwnd, "About Simple Launcher",
                 "Simple Launcher\r\n"
-                "Version 1.91\r\n"
+                "Version 1.95\r\n"
                 "\r\n"
                 "Author:   UberGuidoZ\r\n"
                 "Contact:  https://github.com/UberGuidoZ");
@@ -1242,13 +1486,19 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             g_editIndex = -1;
             g_hwndDlg = CreateWindowEx(WS_EX_DLGMODALFRAME, "AddDlgClass", "Add Button",
                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                CW_USEDEFAULT, CW_USEDEFAULT, 400, 430,
+                CW_USEDEFAULT, CW_USEDEFAULT, 400, 460,
                 hwnd, NULL, g_hInst, NULL);
             SetTitleBarDark(g_hwndDlg, g_darkMode);
             ShowWindow(g_hwndDlg, SW_SHOW); UpdateWindow(g_hwndDlg);
 
         } else if (id >= ID_BUTTON_BASE && id < ID_BUTTON_BASE + g_count) {
             int idx = id - ID_BUTTON_BASE;
+            /* Category header: toggle collapsed state */
+            if (g_buttons[idx].isCategory) {
+                g_collapsed[idx] = !g_collapsed[idx];
+                RefreshMainWindow();
+                return 0;
+            }
             if (!g_buttons[idx].isSeparator) {
                 const char *workDir = g_buttons[idx].workDir[0] ? g_buttons[idx].workDir : NULL;
                 HINSTANCE hRet = ShellExecute(NULL,
@@ -1272,9 +1522,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         RemoveTrayIcon();
         FreeIcons();
         if (g_hwndTooltip) { DestroyWindow(g_hwndTooltip); g_hwndTooltip = NULL; }
+        if (g_hwndSearch)  { DestroyWindow(g_hwndSearch);  g_hwndSearch  = NULL; }
         SaveAll();
-        if (g_hbrDkBg) { DeleteObject(g_hbrDkBg); g_hbrDkBg = NULL; }
-        if (g_hFont)   { DeleteObject(g_hFont);   g_hFont   = NULL; }
+        if (g_hbrDkBg)     { DeleteObject(g_hbrDkBg);     g_hbrDkBg     = NULL; }
+        if (g_hbrSearchDk) { DeleteObject(g_hbrSearchDk); g_hbrSearchDk = NULL; }
+        if (g_hFont)       { DeleteObject(g_hFont);       g_hFont       = NULL; }
+        if (g_hFontBold)   { DeleteObject(g_hFontBold);   g_hFontBold   = NULL; }
         PostQuitMessage(0);
         return 0;
     }
@@ -1290,7 +1543,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     LoadButtons();
     RecreateFont();
     LoadButtonIcons();
-    if (g_darkMode) g_hbrDkBg = CreateSolidBrush(DK_BG);
+    if (g_darkMode) {
+        g_hbrDkBg     = CreateSolidBrush(DK_BG);
+        g_hbrSearchDk = CreateSolidBrush(DK_SEARCH);
+    }
 
     /* Register dialog window classes — reuse one struct, vary only proc + name */
     WNDCLASS wcd = {0};
