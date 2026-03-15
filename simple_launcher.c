@@ -13,9 +13,9 @@
  *   - Tooltips showing path, args, and working directory on hover
  *   - Working directory field per button
  *   - Open INI in Notepad from menu bar
- *   - Categories — collapsible group headers to organise buttons
- *   - Search / filter bar — type to instantly filter buttons by name
- *   - Compact mode — icon-only grid palette for a tiny always-on-top layout
+ *   - Categories - collapsible group headers to organise buttons
+ *   - Search / filter bar - type to instantly filter buttons by name
+ *   - Compact mode - icon-only grid palette for a tiny always-on-top layout
  *   - Open file location from right-click context menu
  *   - Version 1.95
  *
