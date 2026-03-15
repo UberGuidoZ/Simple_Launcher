@@ -23,20 +23,20 @@ Features:
 
 ![Example use](https://raw.githubusercontent.com/UberGuidoZ/Simple_Launcher/refs/heads/main/Documentation/6-Example_Use.gif)
 
-Main Windows<br>
-![Main Windows](https://raw.githubusercontent.com/UberGuidoZ/Simple_Launcher/refs/heads/main/Documentation/1-Main_Window.png)
+Main Window<br>
+![Main Windows](https://raw.githubusercontent.com/UberGuidoZ/Simple_Launcher/refs/heads/main/Documentation/01-Main_Window.png)
 
-Settins<br>
+Settings<br>
 ![Settings](https://raw.githubusercontent.com/UberGuidoZ/Simple_Launcher/refs/heads/main/Documentation/2-Settings.png)
 
-Button Add<br>
+Add Button<br>
 ![Button Add](https://raw.githubusercontent.com/UberGuidoZ/Simple_Launcher/refs/heads/main/Documentation/3-Button_Add.png)
-
-Instructions<br>
-![Instructions](https://raw.githubusercontent.com/UberGuidoZ/Simple_Launcher/refs/heads/main/Documentation/4-Instructions.png)
 
 Profiles<br>
 ![Profiles](https://raw.githubusercontent.com/UberGuidoZ/Simple_Launcher/refs/heads/main/Documentation/5-Profiles.png)
+
+Instructions<br>
+![Instructions](https://raw.githubusercontent.com/UberGuidoZ/Simple_Launcher/refs/heads/main/Documentation/4-Instructions.png)
 
 ## Donation Information
 
