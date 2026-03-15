@@ -1,5 +1,6 @@
 # Simple Launcher
-Simple Launcher shows a configurable list of buttons. Click a button to launch the program or file assigned to it.
+Simple Launcher shows a configurable list of buttons with optional organization.<br>
+Click a button to launch whatever program, file, folder, script, or URL you assigned.
 
 Features:
  * INI-configured buttons with optional icons, separators, admin elevation
@@ -8,7 +9,7 @@ Features:
  * Always on top, minimize to system tray
  * Right-click buttons to Edit / Duplicate / Delete / Move Up / Move Down
  * Separator (divider) lines between buttons
- * Icon extracted from target .exe (optional per button)
+ * Icon extracted from target .exe (optional per button) or custom ICO
  * Remembers last window position
  * Tooltips showing path, args, and working directory on hover
  * Working directory field per button
