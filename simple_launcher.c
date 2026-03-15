@@ -1,20 +1,23 @@
 /*
- * simple_launcher.c - Simple Launcher v1.9
+ * simple_launcher.c - Simple Launcher v1.91
  *
  * Features:
  *   - INI-configured buttons with optional icons, separators, admin elevation
  *   - Dark mode with custom admin border color (via color picker)
  *   - Configurable font size and window width
  *   - Always on top, minimize to system tray
- *   - Right-click buttons to Edit / Delete / Move Up / Move Down
+ *   - Right-click buttons to Edit / Duplicate / Delete / Move Up / Move Down
  *   - Separator (divider) lines between buttons
  *   - Icon extracted from target .exe (optional per button)
  *   - Remembers last window position
- *   - Version 1.9
+ *   - Tooltips showing path, args, and working directory on hover
+ *   - Working directory field per button
+ *   - Open INI in Notepad from menu bar
+ *   - Version 1.91
  *
  * Compile:
  *
- *   cl simple_launcher.c simple_launcher.res /link user32.lib shell32.lib comdlg32.lib gdi32.lib dwmapi.lib /subsystem:windows /out:launcher.exe
+ *   cl simple_launcher.c simple_launcher.res /link user32.lib shell32.lib comdlg32.lib gdi32.lib dwmapi.lib ole32.lib /subsystem:windows /out:simple_launcher.exe
  */
 
 #include <windows.h>
@@ -24,6 +27,7 @@
 #include <commdlg.h>
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <shlobj.h>
 
 /* ── Forward declarations ────────────────────────────────────────────── */
 static void RefreshMainWindow(void);
@@ -61,17 +65,21 @@ static void SetTitleBarDark(HWND hwnd, int dark);
 #define IDC_ICON_BROWSE       38
 #define IDC_OPACITY_EDIT      39
 #define IDC_TITLE_EDIT        40
+#define IDC_WORKDIR_EDIT      41
+#define IDC_WORKDIR_BROWSE    42
 
 /* Menu IDs */
 #define ID_HELP_INSTRUCTIONS  20
 #define ID_HELP_ABOUT         21
 #define ID_SETTINGS           22
+#define ID_OPEN_INI           23
 
 /* Right-click context menu */
 #define IDM_MOVE_UP           300
 #define IDM_MOVE_DOWN         301
 #define IDM_EDIT_BTN          302
 #define IDM_DELETE_BTN        303
+#define IDM_DUPLICATE_BTN     304
 
 /* System tray */
 #define WM_TRAYICON           (WM_APP + 1)
@@ -90,14 +98,15 @@ static void SetTitleBarDark(HWND hwnd, int dark);
 #define DK_SEP      RGB( 70,  70,  70)
 #define LT_SEP      RGB(160, 160, 160)
 
-static const char *g_menuLabels[] = { "Instructions", "Settings", "About" };
-static const UINT  g_menuIDs[]    = { ID_HELP_INSTRUCTIONS, ID_SETTINGS, ID_HELP_ABOUT };
+static const char *g_menuLabels[] = { "Instructions", "Settings", "Open INI", "About" };
+static const UINT  g_menuIDs[]    = { ID_HELP_INSTRUCTIONS, ID_SETTINGS, ID_OPEN_INI, ID_HELP_ABOUT };
 
 /* ── Data ────────────────────────────────────────────────────────────── */
 typedef struct {
     char name[256];
     char path[MAX_PATH];
     char args[512];
+    char workDir[MAX_PATH]; /* working directory, or empty = use exe's directory */
     char iconPath[MAX_PATH];  /* custom icon file, or empty = use target .exe */
     int  admin;
     int  isSeparator;
@@ -136,6 +145,10 @@ static COLORREF     g_customColors[16];
 
 static const char  *g_infoDlgTitle   = NULL;
 static const char  *g_infoDlgContent = NULL;
+
+/* Tooltips */
+static HWND  g_hwndTooltip = NULL;
+static char  g_tooltipText[MAX_BUTTONS][384];
 
 /* ── DWM dark title bar ──────────────────────────────────────────────── */
 static void SetTitleBarDark(HWND hwnd, int dark)
@@ -257,6 +270,7 @@ static void LoadButtons(void)
         GetPrivateProfileString(sec, "Name", "",  g_buttons[i].name, 256,      g_iniPath);
         GetPrivateProfileString(sec, "Path", "",  g_buttons[i].path, MAX_PATH, g_iniPath);
         GetPrivateProfileString(sec, "Args",     "", g_buttons[i].args,     512,      g_iniPath);
+        GetPrivateProfileString(sec, "WorkDir",  "", g_buttons[i].workDir,  MAX_PATH, g_iniPath);
         GetPrivateProfileString(sec, "IconPath", "", g_buttons[i].iconPath, MAX_PATH, g_iniPath);
         g_buttons[i].admin       = GetPrivateProfileInt(sec, "Admin",     0, g_iniPath);
         g_buttons[i].isSeparator = GetPrivateProfileInt(sec, "Separator", 0, g_iniPath);
@@ -294,6 +308,7 @@ static void SaveAll(void)
         fprintf(f, "Name=%s\r\n",      g_buttons[i].name);
         fprintf(f, "Path=%s\r\n",      g_buttons[i].path);
         fprintf(f, "Args=%s\r\n",      g_buttons[i].args);
+        fprintf(f, "WorkDir=%s\r\n",   g_buttons[i].workDir);
         fprintf(f, "IconPath=%s\r\n",  g_buttons[i].iconPath);
         fprintf(f, "Admin=%d\r\n",     g_buttons[i].admin);
         fprintf(f, "Separator=%d\r\n", g_buttons[i].isSeparator);
@@ -440,6 +455,8 @@ static void RefreshMainWindow(void)
     for (int i = 0; i < MAX_BUTTONS; i++) {
         if (g_hwndBtns[i]) { DestroyWindow(g_hwndBtns[i]); g_hwndBtns[i] = NULL; }
     }
+    if (g_hwndTooltip) { DestroyWindow(g_hwndTooltip); g_hwndTooltip = NULL; }
+
     int btnW = g_winWidth - 20;
     int y    = 10;
     for (int i = 0; i < g_count; i++) {
@@ -463,6 +480,41 @@ static void RefreshMainWindow(void)
     SetWindowPos(g_hwndMain, NULL, 0, 0,
                  rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER);
     InvalidateRect(g_hwndMain, NULL, TRUE);
+
+    /* ── Tooltips: show path + args on hover ── */
+    g_hwndTooltip = CreateWindowEx(WS_EX_TOPMOST, TOOLTIPS_CLASS, NULL,
+        WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+        g_hwndMain, NULL, g_hInst, NULL);
+    if (g_hwndTooltip) {
+        SendMessage(g_hwndTooltip, TTM_SETMAXTIPWIDTH, 0, 400);
+        SendMessage(g_hwndTooltip, TTM_SETDELAYTIME, TTDT_INITIAL, 500);
+        for (int i = 0; i < g_count; i++) {
+            if (!g_hwndBtns[i] || g_buttons[i].isSeparator) continue;
+            /* Build tip: path, optional args, optional workdir */
+            char *tip = g_tooltipText[i];
+            int pos = 0;
+            pos += snprintf(tip + pos, sizeof(g_tooltipText[i]) - pos,
+                            "%s", g_buttons[i].path);
+            if (g_buttons[i].args[0])
+                pos += snprintf(tip + pos, sizeof(g_tooltipText[i]) - pos,
+                                "\nArgs: %s", g_buttons[i].args);
+            if (g_buttons[i].workDir[0])
+                pos += snprintf(tip + pos, sizeof(g_tooltipText[i]) - pos,
+                                "\nDir:  %s", g_buttons[i].workDir);
+            if (g_buttons[i].admin)
+                snprintf(tip + pos, sizeof(g_tooltipText[i]) - pos,
+                         "\n[Run as Administrator]");
+
+            TOOLINFO ti; ZeroMemory(&ti, sizeof(ti));
+            ti.cbSize   = sizeof(TOOLINFO);
+            ti.uFlags   = TTF_IDISHWND | TTF_SUBCLASS;
+            ti.hwnd     = g_hwndMain;
+            ti.uId      = (UINT_PTR)g_hwndBtns[i];
+            ti.lpszText = g_tooltipText[i];
+            SendMessage(g_hwndTooltip, TTM_ADDTOOL, 0, (LPARAM)&ti);
+        }
+    }
 }
 
 /* ── Right-click context menu ────────────────────────────────────────── */
@@ -476,6 +528,8 @@ static void ShowButtonContextMenu(HWND hwnd, int idx, POINT pt)
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
     if (!g_buttons[idx].isSeparator)
         AppendMenu(hMenu, MF_STRING, IDM_EDIT_BTN, "Edit...");
+    AppendMenu(hMenu, MF_STRING | (g_count >= MAX_BUTTONS ? MF_GRAYED : 0),
+               IDM_DUPLICATE_BTN, "Duplicate");
     AppendMenu(hMenu, MF_STRING, IDM_DELETE_BTN, "Delete");
     SetForegroundWindow(hwnd);
     TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
@@ -692,33 +746,43 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                      WS_VISIBLE|WS_CHILD|WS_BORDER|ES_AUTOHSCROLL,
                      10, 140, 370, 24, hwnd, (HMENU)IDC_ARGS_EDIT, g_hInst, NULL);
 
+        CreateWindow("STATIC", "Working directory (optional):", WS_VISIBLE|WS_CHILD,
+                     10, 172, 240, 18, hwnd, NULL, g_hInst, NULL);
+        CreateWindow("EDIT", edit ? bc->workDir : "",
+                     WS_VISIBLE|WS_CHILD|WS_BORDER|ES_AUTOHSCROLL,
+                     10, 192, 285, 24, hwnd, (HMENU)IDC_WORKDIR_EDIT, g_hInst, NULL);
+        CreateWindow("BUTTON", "Browse...", WS_VISIBLE|WS_CHILD|BS_PUSHBUTTON,
+                     305, 192, 75, 24, hwnd, (HMENU)IDC_WORKDIR_BROWSE, g_hInst, NULL);
+
         CreateWindow("BUTTON", "Run as administrator",
                      WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX,
-                     10, 175, 220, 22, hwnd, (HMENU)IDC_ADMIN_CHECK, g_hInst, NULL);
+                     10, 225, 220, 22, hwnd, (HMENU)IDC_ADMIN_CHECK, g_hInst, NULL);
         if (edit && bc->admin) SendDlgItemMessage(hwnd, IDC_ADMIN_CHECK, BM_SETCHECK, BST_CHECKED, 0);
 
         CreateWindow("BUTTON", "Show icon from program",
                      WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX,
-                     10, 200, 220, 20, hwnd, (HMENU)IDC_ICON_CHECK, g_hInst, NULL);
+                     10, 250, 220, 20, hwnd, (HMENU)IDC_ICON_CHECK, g_hInst, NULL);
         if (edit && bc->showIcon) SendDlgItemMessage(hwnd, IDC_ICON_CHECK, BM_SETCHECK, BST_CHECKED, 0);
 
         CreateWindow("STATIC", "Custom icon (ICO/PNG, optional):",
-                     WS_VISIBLE|WS_CHILD, 10, 228, 220, 18, hwnd, NULL, g_hInst, NULL);
+                     WS_VISIBLE|WS_CHILD, 10, 278, 220, 18, hwnd, NULL, g_hInst, NULL);
         CreateWindow("EDIT", edit ? bc->iconPath : "",
                      WS_VISIBLE|WS_CHILD|WS_BORDER|ES_AUTOHSCROLL,
-                     10, 248, 285, 22, hwnd, (HMENU)IDC_ICON_PATH_EDIT, g_hInst, NULL);
+                     10, 298, 285, 22, hwnd, (HMENU)IDC_ICON_PATH_EDIT, g_hInst, NULL);
         CreateWindow("BUTTON", "Browse...", WS_VISIBLE|WS_CHILD|BS_PUSHBUTTON,
-                     305, 248, 75, 22, hwnd, (HMENU)IDC_ICON_BROWSE, g_hInst, NULL);
+                     305, 298, 75, 22, hwnd, (HMENU)IDC_ICON_BROWSE, g_hInst, NULL);
 
         CreateWindow("BUTTON", "Separator (divider line)",
                      WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX,
-                     10, 278, 220, 20, hwnd, (HMENU)IDC_SEP_CHECK, g_hInst, NULL);
+                     10, 328, 220, 20, hwnd, (HMENU)IDC_SEP_CHECK, g_hInst, NULL);
         if (edit && bc->isSeparator) {
             SendDlgItemMessage(hwnd, IDC_SEP_CHECK, BM_SETCHECK, BST_CHECKED, 0);
             EnableWindow(GetDlgItem(hwnd, IDC_NAME_EDIT),       FALSE);
             EnableWindow(GetDlgItem(hwnd, IDC_PATH_EDIT),       FALSE);
             EnableWindow(GetDlgItem(hwnd, IDC_ARGS_EDIT),       FALSE);
             EnableWindow(GetDlgItem(hwnd, IDC_BROWSE),          FALSE);
+            EnableWindow(GetDlgItem(hwnd, IDC_WORKDIR_EDIT),    FALSE);
+            EnableWindow(GetDlgItem(hwnd, IDC_WORKDIR_BROWSE),  FALSE);
             EnableWindow(GetDlgItem(hwnd, IDC_ADMIN_CHECK),     FALSE);
             EnableWindow(GetDlgItem(hwnd, IDC_ICON_CHECK),      FALSE);
             EnableWindow(GetDlgItem(hwnd, IDC_ICON_PATH_EDIT),  FALSE);
@@ -727,10 +791,10 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
         CreateWindow("BUTTON", edit ? "Save" : "Add",
                      WS_VISIBLE|WS_CHILD|BS_DEFPUSHBUTTON,
-                     210, 312, 80, 28, hwnd, (HMENU)IDC_OK, g_hInst, NULL);
+                     210, 362, 80, 28, hwnd, (HMENU)IDC_OK, g_hInst, NULL);
         CreateWindow("BUTTON", "Cancel",
                      WS_VISIBLE|WS_CHILD|BS_PUSHBUTTON,
-                     300, 312, 80, 28, hwnd, (HMENU)IDC_CANCEL, g_hInst, NULL);
+                     300, 362, 80, 28, hwnd, (HMENU)IDC_CANCEL, g_hInst, NULL);
         return 0;
     }
 
@@ -742,6 +806,8 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             EnableWindow(GetDlgItem(hwnd, IDC_PATH_EDIT),      !sep);
             EnableWindow(GetDlgItem(hwnd, IDC_ARGS_EDIT),      !sep);
             EnableWindow(GetDlgItem(hwnd, IDC_BROWSE),         !sep);
+            EnableWindow(GetDlgItem(hwnd, IDC_WORKDIR_EDIT),   !sep);
+            EnableWindow(GetDlgItem(hwnd, IDC_WORKDIR_BROWSE), !sep);
             EnableWindow(GetDlgItem(hwnd, IDC_ADMIN_CHECK),    !sep);
             EnableWindow(GetDlgItem(hwnd, IDC_ICON_CHECK),     !sep);
             EnableWindow(GetDlgItem(hwnd, IDC_ICON_PATH_EDIT), !sep);
@@ -759,6 +825,21 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             ofn.lpstrFilter = "Icon files\0*.ico;*.png\0All Files\0*.*\0";
             ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
             if (GetOpenFileName(&ofn)) SetDlgItemText(hwnd, IDC_ICON_PATH_EDIT, file);
+            break;
+        }
+        case IDC_WORKDIR_BROWSE: {
+            /* Use SHBrowseForFolder to pick a directory */
+            BROWSEINFO bi; ZeroMemory(&bi, sizeof(bi));
+            bi.hwndOwner = hwnd;
+            bi.lpszTitle = "Select working directory";
+            bi.ulFlags   = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+            LPITEMIDLIST pidl = SHBrowseForFolder(&bi);
+            if (pidl) {
+                char dir[MAX_PATH] = "";
+                if (SHGetPathFromIDList(pidl, dir))
+                    SetDlgItemText(hwnd, IDC_WORKDIR_EDIT, dir);
+                CoTaskMemFree(pidl);
+            }
             break;
         }
         case IDC_BROWSE: {
@@ -793,15 +874,18 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 strcpy(g_buttons[ti].name, "---");
                 g_buttons[ti].path[0]     = 0;
                 g_buttons[ti].args[0]     = 0;
+                g_buttons[ti].workDir[0]  = 0;
                 g_buttons[ti].iconPath[0] = 0;
                 g_buttons[ti].admin       = 0;
                 g_buttons[ti].showIcon    = 0;
             } else {
-                char iconPath[MAX_PATH];
+                char iconPath[MAX_PATH], workDir[MAX_PATH];
                 GetDlgItemText(hwnd, IDC_ICON_PATH_EDIT, iconPath, MAX_PATH);
+                GetDlgItemText(hwnd, IDC_WORKDIR_EDIT,   workDir,  MAX_PATH);
                 strcpy(g_buttons[ti].name,     name);
                 strcpy(g_buttons[ti].path,     path);
                 strcpy(g_buttons[ti].args,     args);
+                strcpy(g_buttons[ti].workDir,  workDir);
                 strcpy(g_buttons[ti].iconPath, iconPath);
                 g_buttons[ti].admin    = (SendDlgItemMessage(hwnd, IDC_ADMIN_CHECK, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
                 g_buttons[ti].showIcon = (SendDlgItemMessage(hwnd, IDC_ICON_CHECK,  BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
@@ -1044,7 +1128,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             g_editIndex = g_ctxIndex; g_ctxIndex = -1;
             g_hwndDlg = CreateWindowEx(WS_EX_DLGMODALFRAME, "AddDlgClass", "Edit Button",
                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                CW_USEDEFAULT, CW_USEDEFAULT, 400, 390,
+                CW_USEDEFAULT, CW_USEDEFAULT, 400, 430,
                 hwnd, NULL, g_hInst, NULL);
             SetTitleBarDark(g_hwndDlg, g_darkMode);
             ShowWindow(g_hwndDlg, SW_SHOW); UpdateWindow(g_hwndDlg);
@@ -1064,6 +1148,30 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             }
             g_ctxIndex = -1;
 
+        } else if (id == IDM_DUPLICATE_BTN && g_ctxIndex >= 0) {
+            if (g_count >= MAX_BUTTONS) {
+                MessageBox(hwnd, "Maximum number of buttons reached.", "Error", MB_OK | MB_ICONWARNING);
+            } else {
+                /* Shift everything after the source down one slot */
+                for (int i = g_count; i > g_ctxIndex + 1; i--) {
+                    g_buttons[i] = g_buttons[i - 1];
+                    g_icons[i]   = NULL;
+                }
+                /* Copy the source into the slot immediately below it */
+                g_buttons[g_ctxIndex + 1] = g_buttons[g_ctxIndex];
+                char *nm = g_buttons[g_ctxIndex + 1].name;
+                if ((int)strlen(nm) + 7 < 256) strcat(nm, " (copy)");
+                g_icons[g_ctxIndex + 1] = NULL;
+                g_count++;
+                LoadButtonIcons();
+                SaveAll();
+                RefreshMainWindow();
+            }
+            g_ctxIndex = -1;
+
+        } else if (id == ID_OPEN_INI) {
+            ShellExecute(NULL, "open", "notepad.exe", g_iniPath, NULL, SW_SHOW);
+
         } else if (id == ID_HELP_INSTRUCTIONS) {
             ShowInfoDialog(hwnd, "Instructions",
                 "HOW IT WORKS\r\n"
@@ -1075,13 +1183,18 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 "  - Display name: label shown on the button\r\n"
                 "  - Path to launch: full path to a program or file\r\n"
                 "  - Arguments / options: optional command-line arguments\r\n"
+                "  - Working directory: folder the program starts in (optional)\r\n"
                 "  - Run as administrator: triggers a UAC elevation prompt\r\n"
                 "  - Show icon from program: shows the .exe icon on the button\r\n"
                 "  - Separator: inserts a thin divider line instead of a button\r\n"
                 "\r\n"
                 "EDITING / DELETING / REORDERING\r\n"
                 "Right-click any button to open a context menu with options to "
-                "Edit, Delete, Move Up, or Move Down.\r\n"
+                "Edit, Duplicate, Delete, Move Up, or Move Down.\r\n"
+                "\r\n"
+                "TOOLTIPS\r\n"
+                "Hover over any button to see its full path, arguments, and "
+                "working directory in a tooltip.\r\n"
                 "\r\n"
                 "ADMIN BORDER COLOR\r\n"
                 "Buttons set to run as administrator display a colored border "
@@ -1104,7 +1217,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 "\r\n"
                 "CONFIGURATION FILE\r\n"
                 "All settings are saved automatically to launcher.ini in the "
-                "same folder as launcher.exe. You can edit it manually in Notepad.");
+                "same folder as launcher.exe. Click 'Open INI' in the menu bar "
+                "to open it directly in Notepad.");
 
         } else if (id == ID_SETTINGS) {
             if (g_hwndDlg) { SetForegroundWindow(g_hwndDlg); break; }
@@ -1118,7 +1232,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         } else if (id == ID_HELP_ABOUT) {
             ShowInfoDialog(hwnd, "About Simple Launcher",
                 "Simple Launcher\r\n"
-                "Version 1.9\r\n"
+                "Version 1.91\r\n"
                 "\r\n"
                 "Author:   UberGuidoZ\r\n"
                 "Contact:  https://github.com/UberGuidoZ");
@@ -1128,7 +1242,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             g_editIndex = -1;
             g_hwndDlg = CreateWindowEx(WS_EX_DLGMODALFRAME, "AddDlgClass", "Add Button",
                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                CW_USEDEFAULT, CW_USEDEFAULT, 400, 390,
+                CW_USEDEFAULT, CW_USEDEFAULT, 400, 430,
                 hwnd, NULL, g_hInst, NULL);
             SetTitleBarDark(g_hwndDlg, g_darkMode);
             ShowWindow(g_hwndDlg, SW_SHOW); UpdateWindow(g_hwndDlg);
@@ -1136,11 +1250,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         } else if (id >= ID_BUTTON_BASE && id < ID_BUTTON_BASE + g_count) {
             int idx = id - ID_BUTTON_BASE;
             if (!g_buttons[idx].isSeparator) {
+                const char *workDir = g_buttons[idx].workDir[0] ? g_buttons[idx].workDir : NULL;
                 HINSTANCE hRet = ShellExecute(NULL,
                                      g_buttons[idx].admin ? "runas" : "open",
                                      g_buttons[idx].path,
                                      g_buttons[idx].args[0] ? g_buttons[idx].args : NULL,
-                                     NULL, SW_SHOW);
+                                     workDir, SW_SHOW);
                 if ((INT_PTR)hRet <= 32) {
                     char errmsg[512];
                     snprintf(errmsg, sizeof(errmsg),
@@ -1156,6 +1271,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     case WM_DESTROY:
         RemoveTrayIcon();
         FreeIcons();
+        if (g_hwndTooltip) { DestroyWindow(g_hwndTooltip); g_hwndTooltip = NULL; }
         SaveAll();
         if (g_hbrDkBg) { DeleteObject(g_hbrDkBg); g_hbrDkBg = NULL; }
         if (g_hFont)   { DeleteObject(g_hFont);   g_hFont   = NULL; }
