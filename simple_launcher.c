@@ -1,5 +1,5 @@
 /*
- * simple_launcher.c - Simple Launcher v1.8
+ * simple_launcher.c - Simple Launcher v1.9
  *
  * Features:
  *   - INI-configured buttons with optional icons, separators, admin elevation
@@ -10,7 +10,7 @@
  *   - Separator (divider) lines between buttons
  *   - Icon extracted from target .exe (optional per button)
  *   - Remembers last window position
- *   - Version 1.8
+ *   - Version 1.9
  *
  * Compile:
  *
@@ -201,7 +201,15 @@ static void GetIniPath(void)
 {
     GetModuleFileName(NULL, g_iniPath, MAX_PATH);
     char *dot = strrchr(g_iniPath, '.');
-    if (dot) strcpy(dot, ".ini"); else strcat(g_iniPath, ".ini");
+    if (dot) {
+        /* Replace extension in-place — safe because ".ini" <= any extension */
+        strcpy(dot, ".ini");
+    } else {
+        /* No extension: append only if there is room */
+        size_t len = strlen(g_iniPath);
+        if (len + 4 < MAX_PATH)
+            strcat(g_iniPath, ".ini");
+    }
 }
 
 static void LoadSettings(void)
@@ -224,6 +232,19 @@ static void LoadSettings(void)
     if (g_winWidth > 800) g_winWidth = 800;
     if (g_opacity < 10)   g_opacity  = 10;
     if (g_opacity > 100)  g_opacity  = 100;
+
+    /* Clamp saved position to the current virtual screen so the window
+       never appears off-screen (e.g. after a monitor is disconnected). */
+    if (g_winX != -1 && g_winY != -1) {
+        int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if (g_winX < vx) g_winX = vx;
+        if (g_winY < vy) g_winY = vy;
+        if (g_winX > vx + vw - 50) g_winX = vx;   /* 50px minimum visible strip */
+        if (g_winY > vy + vh - 50) g_winY = vy;
+    }
 }
 
 static void LoadButtons(void)
@@ -855,6 +876,30 @@ static void ShowInfoDialog(HWND parent, const char *title, const char *content)
     UpdateWindow(g_hwndDlg);
 }
 
+/* ── Dark menu bar repaint (shared by WM_NCPAINT + WM_NCACTIVATE) ──── */
+static void RepaintMenuBar(HWND hwnd)
+{
+    HMENU hMenu = GetMenu(hwnd); int cnt = hMenu ? GetMenuItemCount(hMenu) : 0;
+    MENUBARINFO mbiBar = { sizeof(mbiBar) };
+    if (cnt <= 0 || !GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mbiBar)) return;
+    RECT rcWin; GetWindowRect(hwnd, &rcWin);
+    HDC hdc = GetWindowDC(hwnd);
+    RECT rcBar = { mbiBar.rcBar.left   - rcWin.left, mbiBar.rcBar.top    - rcWin.top,
+                   mbiBar.rcBar.right  - rcWin.left, mbiBar.rcBar.bottom - rcWin.top };
+    HBRUSH hbr = CreateSolidBrush(DK_MENU_BG); FillRect(hdc, &rcBar, hbr); DeleteObject(hbr);
+    SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, DK_TEXT);
+    HFONT hOld = (HFONT)SelectObject(hdc, (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+    int n = sizeof(g_menuLabels) / sizeof(g_menuLabels[0]);
+    for (int i = 0; i < cnt && i < n; i++) {
+        MENUBARINFO mbi = { sizeof(mbi) };
+        if (!GetMenuBarInfo(hwnd, OBJID_MENU, i + 1, &mbi)) continue;
+        RECT rc = { mbi.rcBar.left  - rcWin.left, mbi.rcBar.top    - rcWin.top,
+                    mbi.rcBar.right - rcWin.left, mbi.rcBar.bottom - rcWin.top };
+        DrawText(hdc, g_menuLabels[i], -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    SelectObject(hdc, hOld); ReleaseDC(hwnd, hdc);
+}
+
 /* ── Main window proc ────────────────────────────────────────────────── */
 static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -922,77 +967,13 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
     case WM_NCPAINT: {
         LRESULT res = DefWindowProc(hwnd, msg, wParam, lParam);
-        if (g_darkMode) {
-            HMENU hMenu = GetMenu(hwnd);
-            int cnt = hMenu ? GetMenuItemCount(hMenu) : 0;
-            MENUBARINFO mbiBar = { sizeof(mbiBar) };
-            if (cnt > 0 && GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mbiBar)) {
-                RECT rcWin; GetWindowRect(hwnd, &rcWin);
-                HDC hdc = GetWindowDC(hwnd);
-                /* 1. fill entire menu bar dark */
-                RECT rcBar = {
-                    mbiBar.rcBar.left   - rcWin.left, mbiBar.rcBar.top    - rcWin.top,
-                    mbiBar.rcBar.right  - rcWin.left, mbiBar.rcBar.bottom - rcWin.top
-                };
-                HBRUSH hbr = CreateSolidBrush(DK_MENU_BG);
-                FillRect(hdc, &rcBar, hbr);
-                DeleteObject(hbr);
-                /* 2. redraw each item's label on top of the dark fill */
-                SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, DK_TEXT);
-                HFONT hOld = (HFONT)SelectObject(hdc, (HFONT)GetStockObject(DEFAULT_GUI_FONT));
-                int n = sizeof(g_menuLabels) / sizeof(g_menuLabels[0]);
-                for (int i = 0; i < cnt && i < n; i++) {
-                    MENUBARINFO mbi = { sizeof(mbi) };
-                    if (!GetMenuBarInfo(hwnd, OBJID_MENU, i + 1, &mbi)) continue;
-                    RECT rc = {
-                        mbi.rcBar.left   - rcWin.left, mbi.rcBar.top    - rcWin.top,
-                        mbi.rcBar.right  - rcWin.left, mbi.rcBar.bottom - rcWin.top
-                    };
-                    DrawText(hdc, g_menuLabels[i], -1, &rc,
-                             DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                }
-                SelectObject(hdc, hOld);
-                ReleaseDC(hwnd, hdc);
-            }
-        }
+        if (g_darkMode) RepaintMenuBar(hwnd);
         return res;
     }
 
     case WM_NCACTIVATE: {
         LRESULT res = DefWindowProc(hwnd, msg, wParam, lParam);
-        if (g_darkMode) {
-            HMENU hMenu = GetMenu(hwnd);
-            int cnt = hMenu ? GetMenuItemCount(hMenu) : 0;
-            MENUBARINFO mbiBar = { sizeof(mbiBar) };
-            if (cnt > 0 && GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mbiBar)) {
-                RECT rcWin; GetWindowRect(hwnd, &rcWin);
-                HDC hdc = GetWindowDC(hwnd);
-                RECT rcBar = {
-                    mbiBar.rcBar.left   - rcWin.left, mbiBar.rcBar.top    - rcWin.top,
-                    mbiBar.rcBar.right  - rcWin.left, mbiBar.rcBar.bottom - rcWin.top
-                };
-                HBRUSH hbr = CreateSolidBrush(DK_MENU_BG);
-                FillRect(hdc, &rcBar, hbr);
-                DeleteObject(hbr);
-                SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, DK_TEXT);
-                HFONT hOld = (HFONT)SelectObject(hdc, (HFONT)GetStockObject(DEFAULT_GUI_FONT));
-                int n = sizeof(g_menuLabels) / sizeof(g_menuLabels[0]);
-                for (int i = 0; i < cnt && i < n; i++) {
-                    MENUBARINFO mbi = { sizeof(mbi) };
-                    if (!GetMenuBarInfo(hwnd, OBJID_MENU, i + 1, &mbi)) continue;
-                    RECT rc = {
-                        mbi.rcBar.left   - rcWin.left, mbi.rcBar.top    - rcWin.top,
-                        mbi.rcBar.right  - rcWin.left, mbi.rcBar.bottom - rcWin.top
-                    };
-                    DrawText(hdc, g_menuLabels[i], -1, &rc,
-                             DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                }
-                SelectObject(hdc, hOld);
-                ReleaseDC(hwnd, hdc);
-            }
-        }
+        if (g_darkMode) RepaintMenuBar(hwnd);
         return res;
     }
 
@@ -1000,11 +981,13 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         MEASUREITEMSTRUCT *mis = (MEASUREITEMSTRUCT *)lParam;
         if (mis->CtlType == ODT_MENU) {
             const char *label = (const char *)mis->itemData;
-            HDC hdc = GetDC(hwnd); SIZE sz;
-            GetTextExtentPoint32(hdc, label, (int)strlen(label), &sz);
-            ReleaseDC(hwnd, hdc);
+            HFONT hMenuFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+            HDC hdc = GetDC(hwnd);
+            HFONT hOld = (HFONT)SelectObject(hdc, hMenuFont);
+            SIZE sz; GetTextExtentPoint32(hdc, label, (int)strlen(label), &sz);
+            SelectObject(hdc, hOld); ReleaseDC(hwnd, hdc);
             mis->itemWidth  = sz.cx + 20;
-            mis->itemHeight = sz.cy + 8;
+            mis->itemHeight = GetSystemMetrics(SM_CYMENU); /* match system bar height exactly */
             return TRUE;
         }
         return DefWindowProc(hwnd, msg, wParam, lParam);
@@ -1020,7 +1003,11 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             FillRect(dis->hDC, &dis->rcItem, hbr); DeleteObject(hbr);
             SetBkMode(dis->hDC, TRANSPARENT);
             SetTextColor(dis->hDC, DK_TEXT);
+            /* Select the same font used in WM_NCPAINT to prevent a size/weight
+               jump between the painted state and the hover (DrawItem) state. */
+            HFONT hOld = (HFONT)SelectObject(dis->hDC, (HFONT)GetStockObject(DEFAULT_GUI_FONT));
             DrawText(dis->hDC, label, -1, &dis->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(dis->hDC, hOld);
             return TRUE;
         }
         int id = (int)dis->CtlID;
@@ -1064,7 +1051,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
         } else if (id == IDM_DELETE_BTN && g_ctxIndex >= 0) {
             char confirm[300];
-            sprintf(confirm, "Delete \"%s\"?", g_buttons[g_ctxIndex].name);
+            snprintf(confirm, sizeof(confirm), "Delete \"%s\"?", g_buttons[g_ctxIndex].name);
             if (MessageBox(hwnd, confirm, "Confirm Delete", MB_YESNO | MB_ICONQUESTION) == IDYES) {
                 if (g_icons[g_ctxIndex]) { DestroyIcon(g_icons[g_ctxIndex]); g_icons[g_ctxIndex] = NULL; }
                 for (int i = g_ctxIndex; i < g_count - 1; i++) {
@@ -1131,7 +1118,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         } else if (id == ID_HELP_ABOUT) {
             ShowInfoDialog(hwnd, "About Simple Launcher",
                 "Simple Launcher\r\n"
-                "Version 1.8\r\n"
+                "Version 1.9\r\n"
                 "\r\n"
                 "Author:   UberGuidoZ\r\n"
                 "Contact:  https://github.com/UberGuidoZ");
@@ -1148,12 +1135,20 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
         } else if (id >= ID_BUTTON_BASE && id < ID_BUTTON_BASE + g_count) {
             int idx = id - ID_BUTTON_BASE;
-            if (!g_buttons[idx].isSeparator)
-                ShellExecute(NULL,
-                             g_buttons[idx].admin ? "runas" : "open",
-                             g_buttons[idx].path,
-                             g_buttons[idx].args[0] ? g_buttons[idx].args : NULL,
-                             NULL, SW_SHOW);
+            if (!g_buttons[idx].isSeparator) {
+                HINSTANCE hRet = ShellExecute(NULL,
+                                     g_buttons[idx].admin ? "runas" : "open",
+                                     g_buttons[idx].path,
+                                     g_buttons[idx].args[0] ? g_buttons[idx].args : NULL,
+                                     NULL, SW_SHOW);
+                if ((INT_PTR)hRet <= 32) {
+                    char errmsg[512];
+                    snprintf(errmsg, sizeof(errmsg),
+                             "Failed to launch:\n%s\n\nError code: %d",
+                             g_buttons[idx].path, (int)(INT_PTR)hRet);
+                    MessageBox(hwnd, errmsg, "Launch Error", MB_OK | MB_ICONWARNING);
+                }
+            }
         }
         return 0;
     }
@@ -1181,27 +1176,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     LoadButtonIcons();
     if (g_darkMode) g_hbrDkBg = CreateSolidBrush(DK_BG);
 
-    /* Register window classes */
-    WNDCLASS wcI = {0};
-    wcI.lpfnWndProc = InfoDlgProc; wcI.hInstance = hInstance;
-    wcI.lpszClassName = "InfoDlgClass";
-    wcI.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    wcI.hCursor = LoadCursor(NULL, IDC_ARROW);
-    RegisterClass(&wcI);
-
-    WNDCLASS wcS = {0};
-    wcS.lpfnWndProc = SettingsDlgProc; wcS.hInstance = hInstance;
-    wcS.lpszClassName = "SettingsDlgClass";
-    wcS.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    wcS.hCursor = LoadCursor(NULL, IDC_ARROW);
-    RegisterClass(&wcS);
-
-    WNDCLASS wc2 = {0};
-    wc2.lpfnWndProc = AddDlgProc; wc2.hInstance = hInstance;
-    wc2.lpszClassName = "AddDlgClass";
-    wc2.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    wc2.hCursor = LoadCursor(NULL, IDC_ARROW);
-    RegisterClass(&wc2);
+    /* Register dialog window classes — reuse one struct, vary only proc + name */
+    WNDCLASS wcd = {0};
+    wcd.hInstance    = hInstance;
+    wcd.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wcd.hCursor      = LoadCursor(NULL, IDC_ARROW);
+    wcd.lpfnWndProc  = InfoDlgProc;     wcd.lpszClassName = "InfoDlgClass";     RegisterClass(&wcd);
+    wcd.lpfnWndProc  = SettingsDlgProc; wcd.lpszClassName = "SettingsDlgClass"; RegisterClass(&wcd);
+    wcd.lpfnWndProc  = AddDlgProc;      wcd.lpszClassName = "AddDlgClass";      RegisterClass(&wcd);
 
     WNDCLASSEX wc = {0};
     wc.cbSize        = sizeof(WNDCLASSEX);
@@ -1234,6 +1216,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
+        if (g_hwndDlg && IsDialogMessage(g_hwndDlg, &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
