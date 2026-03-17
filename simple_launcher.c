@@ -1,5 +1,5 @@
 /*
- * simple_launcher.c - Simple Launcher v2.00
+ * simple_launcher.c - Simple Launcher v2.10
  *
  * Features:
  *   - INI-configured buttons with optional icons, separators, admin elevation
@@ -18,12 +18,11 @@
  *   - Compact mode - icon-only grid palette for a tiny always-on-top layout
  *   - Open file location from right-click context menu
  *   - Profiles - switchable INI sets from tray or Profiles menu
- *   - Environment variables - %VAR% expanded in path, args, and working dir
+ *   - Environment variables — %VAR% expanded in path, args, and working dir
  *   - Launch mode per button - Normal, Minimized, or Hidden
- *   - Version 2.00
+ *   - Version 2.10
  *
  * Compile:
- *
  *   cl simple_launcher.c simple_launcher.res /link user32.lib shell32.lib comdlg32.lib gdi32.lib dwmapi.lib ole32.lib comctl32.lib /subsystem:windows /out:simple_launcher.exe
  */
 
@@ -37,15 +36,33 @@
 #include <shellapi.h>
 #include <shlobj.h>
 
+/* DWMWA_USE_IMMERSIVE_DARK_MODE was given value 20 in Windows 20H1+.
+   Pre-20H1 preview builds used value 19. Both are tried for compatibility. */
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+#define DWMWA_USE_IMMERSIVE_DARK_MODE_PRE 19
+
+/* EM_SETBKGNDCOLOR is a RichEdit-only message (value 0x0443). It is sent
+   speculatively to plain EDIT controls for dark-mode background tinting;
+   non-RichEdit windows silently ignore it. */
+#ifndef EM_SETBKGNDCOLOR
+#define EM_SETBKGNDCOLOR 0x0443
+#endif
+
 /* ── Forward declarations ────────────────────────────────────────────── */
 static void RefreshMainWindow(void);
+static void ApplyFilter(void);
 static void RebuildMenu(void);
 static void ApplyDarkBackground(void);
 static void SaveAll(void);
 static void LoadSettings(void);
 static void LoadButtons(void);
 static void LoadButtonIcons(void);
+static void LoadSingleButtonIcon(int i);
 static void FreeIcons(void);
+static void EnsureDarkGDI(void);
+static void FreeDarkGDI(void);
 static void RecreateFont(void);
 static void SetTitleBarDark(HWND hwnd, int dark);
 static void ScanProfiles(void);
@@ -179,6 +196,11 @@ static char         g_iniPath[MAX_PATH];
 static HWND         g_hwndDlg      = NULL;
 static HBRUSH       g_hbrDkBg      = NULL;
 static HBRUSH       g_hbrSearchDk  = NULL;
+static HBRUSH       g_hbrDkBtn     = NULL;    /* cached DK_BTN fill brush */
+static HBRUSH       g_hbrDkBtnPre  = NULL;    /* cached DK_BTN_PRE fill brush */
+static HPEN         g_hpenDkBorder = NULL;    /* cached DK_BORDER outline pen */
+static HPEN         g_hpenDkSep    = NULL;    /* cached DK_SEP separator pen */
+static HPEN         g_hpenLtSep    = NULL;    /* cached LT_SEP separator pen */
 static HFONT        g_hFont        = NULL;
 static HFONT        g_hFontBold    = NULL;   /* bold font for category headers */
 static int          g_trayAdded    = 0;
@@ -212,8 +234,8 @@ static char  g_tooltipText[MAX_BUTTONS][384];
 static void SetTitleBarDark(HWND hwnd, int dark)
 {
     BOOL val = dark ? TRUE : FALSE;
-    if (FAILED(DwmSetWindowAttribute(hwnd, 20, &val, sizeof(val))))
-        DwmSetWindowAttribute(hwnd, 19, &val, sizeof(val));
+    if (FAILED(DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &val, sizeof(val))))
+        DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_PRE, &val, sizeof(val));
 }
 
 /* ── Opacity ─────────────────────────────────────────────────────────── */
@@ -277,7 +299,8 @@ static void GetBasePath(void)
     GetModuleFileName(NULL, g_basePath, MAX_PATH);
     char *dot = strrchr(g_basePath, '.');
     if (dot) {
-        strcpy(dot, ".ini");
+        if ((dot - g_basePath) + 5 <= MAX_PATH)
+            strcpy(dot, ".ini");
     } else {
         size_t len = strlen(g_basePath);
         if (len + 4 < MAX_PATH) strcat(g_basePath, ".ini");
@@ -411,7 +434,7 @@ static void LoadButtons(void)
     if (g_count > MAX_BUTTONS) g_count = MAX_BUTTONS;
     for (int i = 0; i < g_count; i++) {
         char sec[32];
-        sprintf(sec, "Button%d", i + 1);
+        snprintf(sec, sizeof(sec), "Button%d", i + 1);
         GetPrivateProfileString(sec, "Name", "",  g_buttons[i].name, 256,      g_iniPath);
         GetPrivateProfileString(sec, "Path", "",  g_buttons[i].path, MAX_PATH, g_iniPath);
         GetPrivateProfileString(sec, "Args",     "", g_buttons[i].args,     512,      g_iniPath);
@@ -426,6 +449,16 @@ static void LoadButtons(void)
             g_buttons[i].launchMode = 0;   /* clamp invalid values to Normal */
         g_collapsed[i] = 0;
     }
+}
+
+/* Writes key=value to f, replacing any CR or LF in value with a space.
+   This prevents a user-supplied string from injecting extra INI sections. */
+static void WriteEscaped(FILE *f, const char *key, const char *val)
+{
+    fprintf(f, "%s=", key);
+    for (; *val; val++)
+        fputc((*val == '\r' || *val == '\n') ? ' ' : *val, f);
+    fputs("\r\n", f);
 }
 
 static void SaveAll(void)
@@ -449,18 +482,18 @@ static void SaveAll(void)
     fprintf(f, "WindowY=%d\r\n",          g_winY);
     fprintf(f, "Opacity=%d\r\n",          g_opacity);
     fprintf(f, "CompactMode=%d\r\n",      g_compactMode);
-    fprintf(f, "WindowTitle=%s\r\n",      g_winTitle);
+    WriteEscaped(f, "WindowTitle",        g_winTitle);
     fprintf(f, "\r\n");
     fprintf(f, "[Buttons]\r\n");
     fprintf(f, "Count=%d\r\n", g_count);
     for (int i = 0; i < g_count; i++) {
         fprintf(f, "\r\n");
         fprintf(f, "[Button%d]\r\n",   i + 1);
-        fprintf(f, "Name=%s\r\n",      g_buttons[i].name);
-        fprintf(f, "Path=%s\r\n",      g_buttons[i].path);
-        fprintf(f, "Args=%s\r\n",      g_buttons[i].args);
-        fprintf(f, "WorkDir=%s\r\n",   g_buttons[i].workDir);
-        fprintf(f, "IconPath=%s\r\n",  g_buttons[i].iconPath);
+        WriteEscaped(f, "Name",        g_buttons[i].name);
+        WriteEscaped(f, "Path",        g_buttons[i].path);
+        WriteEscaped(f, "Args",        g_buttons[i].args);
+        WriteEscaped(f, "WorkDir",     g_buttons[i].workDir);
+        WriteEscaped(f, "IconPath",    g_buttons[i].iconPath);
         fprintf(f, "Admin=%d\r\n",      g_buttons[i].admin);
         fprintf(f, "Separator=%d\r\n",  g_buttons[i].isSeparator);
         fprintf(f, "IsCategory=%d\r\n", g_buttons[i].isCategory);
@@ -488,6 +521,48 @@ static void FreeIcons(void)
     for (int i = 0; i < MAX_BUTTONS; i++) {
         if (g_icons[i]) { DestroyIcon(g_icons[i]); g_icons[i] = NULL; }
     }
+}
+
+/* Creates cached GDI objects for dark-mode drawing if they do not yet exist.
+   These constant-color objects are reused across all WM_DRAWITEM calls instead
+   of being allocated and freed on every paint. */
+static void EnsureDarkGDI(void)
+{
+    if (!g_hbrDkBtn)     g_hbrDkBtn     = CreateSolidBrush(DK_BTN);
+    if (!g_hbrDkBtnPre)  g_hbrDkBtnPre  = CreateSolidBrush(DK_BTN_PRE);
+    if (!g_hpenDkBorder) g_hpenDkBorder = CreatePen(PS_SOLID, 1, DK_BORDER);
+    if (!g_hpenDkSep)    g_hpenDkSep    = CreatePen(PS_SOLID, 1, DK_SEP);
+    if (!g_hpenLtSep)    g_hpenLtSep    = CreatePen(PS_SOLID, 1, LT_SEP);
+}
+
+/* Releases all cached dark-mode GDI objects. Called when toggling dark mode
+   off or on application shutdown. */
+static void FreeDarkGDI(void)
+{
+    if (g_hbrDkBtn)     { DeleteObject(g_hbrDkBtn);     g_hbrDkBtn     = NULL; }
+    if (g_hbrDkBtnPre)  { DeleteObject(g_hbrDkBtnPre);  g_hbrDkBtnPre  = NULL; }
+    if (g_hpenDkBorder) { DeleteObject(g_hpenDkBorder); g_hpenDkBorder = NULL; }
+    if (g_hpenDkSep)    { DeleteObject(g_hpenDkSep);    g_hpenDkSep    = NULL; }
+    if (g_hpenLtSep)    { DeleteObject(g_hpenLtSep);    g_hpenLtSep    = NULL; }
+}
+
+/* Loads or reloads the icon for a single button slot.
+   Used after Add, Edit, or Duplicate so that only the affected slot
+   needs updating rather than reloading all icons. */
+static void LoadSingleButtonIcon(int i)
+{
+    if (i < 0 || i >= MAX_BUTTONS) return;
+    if (g_icons[i]) { DestroyIcon(g_icons[i]); g_icons[i] = NULL; }
+    if (!g_buttons[i].showIcon || g_buttons[i].isSeparator) return;
+    const char *src = g_buttons[i].iconPath[0] ? g_buttons[i].iconPath
+                                                : g_buttons[i].path;
+    if (!src[0]) return;
+    HICON hIco = (HICON)LoadImage(NULL, src, IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
+    if (hIco) { g_icons[i] = hIco; return; }
+    HICON hLg = NULL, hSm = NULL;
+    ExtractIconEx(src, 0, &hLg, &hSm, 1);
+    if (hSm) { g_icons[i] = hSm; if (hLg) DestroyIcon(hLg); }
+    else if (hLg) { g_icons[i] = hLg; }
 }
 
 static void LoadButtonIcons(void)
@@ -522,13 +597,12 @@ static void DrawButton(LPDRAWITEMSTRUCT dis, int idx)
     /* ── Compact tile (non-Add) ── */
     if (g_compactMode && idx >= 0) {
         if (g_darkMode) {
-            HBRUSH hbr = CreateSolidBrush(pressed ? DK_BTN_PRE : DK_BTN);
-            FillRect(dis->hDC, &rc, hbr); DeleteObject(hbr);
-            HPEN hp = CreatePen(PS_SOLID, 1, DK_BORDER);
-            HPEN hop = (HPEN)SelectObject(dis->hDC, hp);
+            EnsureDarkGDI();
+            FillRect(dis->hDC, &rc, pressed ? g_hbrDkBtnPre : g_hbrDkBtn);
+            HPEN hop = (HPEN)SelectObject(dis->hDC, g_hpenDkBorder);
             HBRUSH hn = (HBRUSH)SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
             Rectangle(dis->hDC, rc.left, rc.top, rc.right, rc.bottom);
-            SelectObject(dis->hDC, hop); SelectObject(dis->hDC, hn); DeleteObject(hp);
+            SelectObject(dis->hDC, hop); SelectObject(dis->hDC, hn);
         } else {
             FillRect(dis->hDC, &rc, (HBRUSH)(COLOR_BTNFACE + 1));
             DrawEdge(dis->hDC, &rc, pressed ? EDGE_SUNKEN : EDGE_RAISED, BF_RECT);
@@ -575,29 +649,30 @@ static void DrawButton(LPDRAWITEMSTRUCT dis, int idx)
         HBRUSH hbr = CreateSolidBrush(bgCol);
         FillRect(dis->hDC, &rc, hbr); DeleteObject(hbr);
         int midY = (rc.top + rc.bottom) / 2;
-        HPEN hPen = CreatePen(PS_SOLID, 1, g_darkMode ? DK_SEP : LT_SEP);
-        HPEN hOld = (HPEN)SelectObject(dis->hDC, hPen);
+        EnsureDarkGDI();
+        HPEN hOld = (HPEN)SelectObject(dis->hDC,
+                        g_darkMode ? g_hpenDkSep : g_hpenLtSep);
         MoveToEx(dis->hDC, rc.left + 6, midY, NULL);
         LineTo(dis->hDC,   rc.right - 6, midY);
-        SelectObject(dis->hDC, hOld); DeleteObject(hPen);
+        SelectObject(dis->hDC, hOld);
         return;
     }
 
     /* ── Normal button ── */
     int isAdmin = (idx >= 0 && idx < g_count) ? g_buttons[idx].admin : 0;
     if (g_darkMode) {
-        HBRUSH hbr = CreateSolidBrush(pressed ? DK_BTN_PRE : DK_BTN);
-        FillRect(dis->hDC, &rc, hbr); DeleteObject(hbr);
-        HPEN   hPen  = CreatePen(PS_SOLID, 1, DK_BORDER);
-        HPEN   hOldP = (HPEN)SelectObject(dis->hDC, hPen);
+        EnsureDarkGDI();
+        FillRect(dis->hDC, &rc, pressed ? g_hbrDkBtnPre : g_hbrDkBtn);
+        HPEN   hOldP = (HPEN)SelectObject(dis->hDC, g_hpenDkBorder);
         HBRUSH hNull = (HBRUSH)SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
         Rectangle(dis->hDC, rc.left, rc.top, rc.right, rc.bottom);
-        SelectObject(dis->hDC, hOldP); SelectObject(dis->hDC, hNull); DeleteObject(hPen);
+        SelectObject(dis->hDC, hOldP); SelectObject(dis->hDC, hNull);
     } else {
         FillRect(dis->hDC, &rc, (HBRUSH)(COLOR_BTNFACE + 1));
         DrawEdge(dis->hDC, &rc, pressed ? EDGE_SUNKEN : EDGE_RAISED, BF_RECT);
     }
     if (isAdmin) {
+        /* Admin border pen is per-call because its color is user-configurable. */
         HPEN   hPen  = CreatePen(PS_SOLID, 2, g_adminColor);
         HPEN   hOldP = (HPEN)SelectObject(dis->hDC, hPen);
         HBRUSH hNull = (HBRUSH)SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
@@ -629,9 +704,11 @@ static void ApplyDarkBackground(void)
 {
     if (g_hbrDkBg)     { DeleteObject(g_hbrDkBg);     g_hbrDkBg     = NULL; }
     if (g_hbrSearchDk) { DeleteObject(g_hbrSearchDk); g_hbrSearchDk = NULL; }
+    FreeDarkGDI();
     if (g_darkMode) {
         g_hbrDkBg     = CreateSolidBrush(DK_BG);
         g_hbrSearchDk = CreateSolidBrush(DK_SEARCH);
+        EnsureDarkGDI();
     }
     if (g_hwndSearch) InvalidateRect(g_hwndSearch, NULL, TRUE);
 }
@@ -806,6 +883,65 @@ static void RefreshMainWindow(void)
     }
 }
 
+/* ── Filter-only refresh ─────────────────────────────────────────────── */
+/* Called when the search text changes. Instead of destroying and recreating
+   all child windows, this function shows or hides existing button windows
+   and repositions them, which eliminates the flicker caused by repeated
+   DestroyWindow / CreateWindow cycles on every keystroke. For layout changes
+   that require full reconstruction (compact mode, profile switch, etc.) the
+   code still calls RefreshMainWindow. */
+static void ApplyFilter(void)
+{
+    if (g_compactMode) { RefreshMainWindow(); return; }
+
+    int btnW  = g_winWidth - 20;
+    int y     = 10 + 22 + 6;
+
+    if (g_filterText[0]) {
+        /* Flat filtered list: show only matching regular buttons. */
+        for (int i = 0; i < g_count; i++) {
+            if (!g_hwndBtns[i]) continue;
+            int show = ButtonMatchesFilter(i);
+            if (show) {
+                SetWindowPos(g_hwndBtns[i], NULL, 10, y, btnW, 26,
+                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                y += 26 + 5;
+            } else {
+                ShowWindow(g_hwndBtns[i], SW_HIDE);
+            }
+        }
+    } else {
+        /* Full list with category collapse state restored. */
+        int catCollapsed = 0;
+        for (int i = 0; i < g_count; i++) {
+            if (!g_hwndBtns[i]) continue;
+            if (g_buttons[i].isCategory) {
+                catCollapsed = g_collapsed[i];
+                SetWindowPos(g_hwndBtns[i], NULL, 10, y, btnW, 24,
+                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                y += 24 + 3;
+            } else if (catCollapsed) {
+                ShowWindow(g_hwndBtns[i], SW_HIDE);
+            } else {
+                int h = g_buttons[i].isSeparator ? 14 : 26;
+                SetWindowPos(g_hwndBtns[i], NULL, 10, y, btnW, h,
+                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                y += h + 5;
+            }
+        }
+    }
+
+    HWND hAdd = GetDlgItem(g_hwndMain, ID_ADD_BTN);
+    SetWindowPos(hAdd, HWND_TOP, 10, y, btnW, 26, SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+    int clientH = y + 31 + 10;
+    if (clientH < 80) clientH = 80;
+    RECT rc = { 0, 0, g_winWidth, clientH };
+    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, TRUE);
+    SetWindowPos(g_hwndMain, NULL, 0, 0,
+                 rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER);
+    InvalidateRect(g_hwndMain, NULL, TRUE);
+}
+
 /* ── Right-click context menu ────────────────────────────────────────── */
 static void ShowButtonContextMenu(HWND hwnd, int idx, POINT pt)
 {
@@ -889,7 +1025,7 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         /* ── Font ── */
         CreateWindow("STATIC", "Font size:", WS_VISIBLE|WS_CHILD,
                      10, 84, 80, 18, hwnd, NULL, g_hInst, NULL);
-        { char buf[8]; sprintf(buf, "%d", g_fontSize);
+        { char buf[8]; snprintf(buf, sizeof(buf), "%d", g_fontSize);
           CreateWindow("EDIT", buf, WS_VISIBLE|WS_CHILD|WS_BORDER|ES_NUMBER,
                        95, 82, 40, 20, hwnd, (HMENU)IDC_FONT_EDIT, g_hInst, NULL); }
         CreateWindow("STATIC", "pt", WS_VISIBLE|WS_CHILD,
@@ -899,7 +1035,7 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                      10, 113, 200, 16, hwnd, NULL, g_hInst, NULL);
         CreateWindow("STATIC", "Window width:", WS_VISIBLE|WS_CHILD,
                      10, 133, 100, 18, hwnd, NULL, g_hInst, NULL);
-        { char buf[8]; sprintf(buf, "%d", g_winWidth);
+        { char buf[8]; snprintf(buf, sizeof(buf), "%d", g_winWidth);
           CreateWindow("EDIT", buf, WS_VISIBLE|WS_CHILD|WS_BORDER|ES_NUMBER,
                        115, 131, 55, 20, hwnd, (HMENU)IDC_WIDTH_EDIT, g_hInst, NULL); }
         CreateWindow("STATIC", "px", WS_VISIBLE|WS_CHILD,
@@ -928,7 +1064,7 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                      55, 278, 220, 20, hwnd, (HMENU)IDC_TITLE_EDIT, g_hInst, NULL);
         CreateWindow("STATIC", "Opacity:", WS_VISIBLE|WS_CHILD,
                      10, 306, 55, 18, hwnd, NULL, g_hInst, NULL);
-        { char buf[8]; sprintf(buf, "%d", g_opacity);
+        { char buf[8]; snprintf(buf, sizeof(buf), "%d", g_opacity);
           CreateWindow("EDIT", buf, WS_VISIBLE|WS_CHILD|WS_BORDER|ES_NUMBER,
                        70, 304, 40, 20, hwnd, (HMENU)IDC_OPACITY_EDIT, g_hInst, NULL); }
         CreateWindow("STATIC", "% (10-100)", WS_VISIBLE|WS_CHILD,
@@ -1287,7 +1423,7 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             }
             g_buttons[ti].isSeparator = isSep;
             if (g_editIndex < 0) g_count++;
-            LoadButtonIcons();
+            LoadSingleButtonIcon(ti);
             SaveAll();
             RefreshMainWindow();
             DestroyWindow(hwnd);
@@ -1325,7 +1461,7 @@ static LRESULT CALLBACK InfoDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         HWND hEdit = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", g_infoDlgContent,
             WS_VISIBLE|WS_CHILD|WS_VSCROLL|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL,
             10, 10, 460, 300, hwnd, (HMENU)IDC_INFO_TEXT, g_hInst, NULL);
-        if (g_darkMode) SendMessage(hEdit, 0x0443, 0, (LPARAM)DK_BG);
+        if (g_darkMode) SendMessage(hEdit, EM_SETBKGNDCOLOR, 0, (LPARAM)DK_BG);
         CreateWindow("BUTTON", "OK", WS_VISIBLE|WS_CHILD|BS_DEFPUSHBUTTON,
                      195, 320, 90, 28, hwnd, (HMENU)IDC_INFO_OK, g_hInst, NULL);
         return 0;
@@ -1350,6 +1486,7 @@ static void ShowInfoDialog(HWND parent, const char *title, const char *content)
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
                                 CW_USEDEFAULT, CW_USEDEFAULT, 494, 395,
                                 parent, NULL, g_hInst, NULL);
+    if (!g_hwndDlg) return;
     SetTitleBarDark(g_hwndDlg, g_darkMode);
     ShowWindow(g_hwndDlg, SW_SHOW);
     UpdateWindow(g_hwndDlg);
@@ -1532,7 +1669,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         /* Search bar */
         if (id == IDC_SEARCH_EDIT && notif == EN_CHANGE) {
             GetWindowText(g_hwndSearch, g_filterText, sizeof(g_filterText));
-            RefreshMainWindow();
+            ApplyFilter();
             return 0;
         }
 
@@ -1543,6 +1680,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             HICON hi = g_icons[g_ctxIndex];
             g_icons[g_ctxIndex] = g_icons[g_ctxIndex - 1];
             g_icons[g_ctxIndex - 1] = hi;
+            int ci = g_collapsed[g_ctxIndex];
+            g_collapsed[g_ctxIndex]     = g_collapsed[g_ctxIndex - 1];
+            g_collapsed[g_ctxIndex - 1] = ci;
             SaveAll(); RefreshMainWindow(); g_ctxIndex = -1;
 
         } else if (id == IDM_MOVE_DOWN && g_ctxIndex >= 0 && g_ctxIndex < g_count - 1) {
@@ -1552,6 +1692,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             HICON hi = g_icons[g_ctxIndex];
             g_icons[g_ctxIndex] = g_icons[g_ctxIndex + 1];
             g_icons[g_ctxIndex + 1] = hi;
+            int ci = g_collapsed[g_ctxIndex];
+            g_collapsed[g_ctxIndex]     = g_collapsed[g_ctxIndex + 1];
+            g_collapsed[g_ctxIndex + 1] = ci;
             SaveAll(); RefreshMainWindow(); g_ctxIndex = -1;
 
         } else if (id == IDM_EDIT_BTN && g_ctxIndex >= 0) {
@@ -1561,6 +1704,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
                 CW_USEDEFAULT, CW_USEDEFAULT, 400, 490,
                 hwnd, NULL, g_hInst, NULL);
+            if (!g_hwndDlg) break;
             SetTitleBarDark(g_hwndDlg, g_darkMode);
             ShowWindow(g_hwndDlg, SW_SHOW); UpdateWindow(g_hwndDlg);
 
@@ -1570,10 +1714,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             if (MessageBox(hwnd, confirm, "Confirm Delete", MB_YESNO | MB_ICONQUESTION) == IDYES) {
                 if (g_icons[g_ctxIndex]) { DestroyIcon(g_icons[g_ctxIndex]); g_icons[g_ctxIndex] = NULL; }
                 for (int i = g_ctxIndex; i < g_count - 1; i++) {
-                    g_buttons[i] = g_buttons[i + 1];
-                    g_icons[i]   = g_icons[i + 1];
+                    g_buttons[i]   = g_buttons[i + 1];
+                    g_icons[i]     = g_icons[i + 1];
+                    g_collapsed[i] = g_collapsed[i + 1];
                 }
-                g_icons[g_count - 1] = NULL;
+                g_icons[g_count - 1]     = NULL;
+                g_collapsed[g_count - 1] = 0;
                 g_count--;
                 SaveAll(); RefreshMainWindow();
             }
@@ -1585,16 +1731,18 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             } else {
                 /* Shift everything after the source down one slot */
                 for (int i = g_count; i > g_ctxIndex + 1; i--) {
-                    g_buttons[i] = g_buttons[i - 1];
-                    g_icons[i]   = NULL;
+                    g_buttons[i]   = g_buttons[i - 1];
+                    g_icons[i]     = NULL;
+                    g_collapsed[i] = g_collapsed[i - 1];
                 }
                 /* Copy the source into the slot immediately below it */
                 g_buttons[g_ctxIndex + 1] = g_buttons[g_ctxIndex];
                 char *nm = g_buttons[g_ctxIndex + 1].name;
                 if ((int)strlen(nm) + 7 < 256) strcat(nm, " (copy)");
-                g_icons[g_ctxIndex + 1] = NULL;
+                g_icons[g_ctxIndex + 1]     = NULL;
+                g_collapsed[g_ctxIndex + 1] = 0;
                 g_count++;
-                LoadButtonIcons();
+                LoadSingleButtonIcon(g_ctxIndex + 1);
                 SaveAll();
                 RefreshMainWindow();
             }
@@ -1629,21 +1777,33 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
                 CW_USEDEFAULT, CW_USEDEFAULT, 316, 140,
                 hwnd, NULL, g_hInst, NULL);
+            if (!hPr) return 0;
             g_hwndDlg = hPr; SetTitleBarDark(hPr, g_darkMode);
             ShowWindow(hPr, SW_SHOW); UpdateWindow(hPr);
             MSG pmsg;
-            while (!g_promptDone && GetMessage(&pmsg, NULL, 0, 0)) {
+            /* GetMessage returns 0 on WM_QUIT; re-post it so the main loop exits. */
+            while (!g_promptDone && GetMessage(&pmsg, NULL, 0, 0) > 0) {
                 if (IsWindow(hPr) && IsDialogMessage(hPr, &pmsg)) continue;
                 TranslateMessage(&pmsg); DispatchMessage(&pmsg);
             }
+            if (pmsg.message == WM_QUIT) {
+                PostQuitMessage((int)pmsg.wParam);
+                return 0;
+            }
             if (!g_promptCancelled && g_promptResult[0]) {
-                /* Sanitise name */
+                /* Sanitize name: reject control characters, dots, and the
+                   standard Windows filename-illegal characters. Dots are
+                   blocked because a name of ".." would produce a confusing
+                   path and is never a meaningful profile name. */
                 char safe[64]; int si = 0;
                 for (int i = 0; g_promptResult[i] && si < 63; i++) {
-                    char c = g_promptResult[i];
-                    if (c!='/' && c!='\\' && c!=':' && c!='*' && c!='?' &&
-                        c!='"' && c!='<' && c!='>' && c!='|')
-                        safe[si++] = c;
+                    unsigned char c = (unsigned char)g_promptResult[i];
+                    if (c < 32) continue;       /* strip control characters */
+                    if (c == '.') continue;      /* block dot to prevent ".." etc. */
+                    if (c == '/' || c == '\\' || c == ':' || c == '*' ||
+                        c == '?' || c == '"'  || c == '<' || c == '>' || c == '|')
+                        continue;
+                    safe[si++] = (char)c;
                 }
                 safe[si] = '\0';
                 if (!safe[0] || _stricmp(safe, "Default") == 0) {
@@ -1748,13 +1908,14 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
                 CW_USEDEFAULT, CW_USEDEFAULT, 295, 410,
                 hwnd, NULL, g_hInst, NULL);
+            if (!g_hwndDlg) break;
             SetTitleBarDark(g_hwndDlg, g_darkMode);
             ShowWindow(g_hwndDlg, SW_SHOW); UpdateWindow(g_hwndDlg);
 
         } else if (id == ID_HELP_ABOUT) {
             ShowInfoDialog(hwnd, "About Simple Launcher",
                 "Simple Launcher\r\n"
-                "Version 2.00\r\n"
+                "Version 2.10\r\n"
                 "\r\n"
                 "Author:   UberGuidoZ\r\n"
                 "Contact:  https://github.com/UberGuidoZ");
@@ -1766,6 +1927,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
                 CW_USEDEFAULT, CW_USEDEFAULT, 400, 490,
                 hwnd, NULL, g_hInst, NULL);
+            if (!g_hwndDlg) break;
             SetTitleBarDark(g_hwndDlg, g_darkMode);
             ShowWindow(g_hwndDlg, SW_SHOW); UpdateWindow(g_hwndDlg);
 
@@ -1810,6 +1972,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         SaveAll();
         if (g_hbrDkBg)     { DeleteObject(g_hbrDkBg);     g_hbrDkBg     = NULL; }
         if (g_hbrSearchDk) { DeleteObject(g_hbrSearchDk); g_hbrSearchDk = NULL; }
+        FreeDarkGDI();
         if (g_hFont)       { DeleteObject(g_hFont);       g_hFont       = NULL; }
         if (g_hFontBold)   { DeleteObject(g_hFontBold);   g_hFontBold   = NULL; }
         PostQuitMessage(0);
@@ -1832,6 +1995,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     if (g_darkMode) {
         g_hbrDkBg     = CreateSolidBrush(DK_BG);
         g_hbrSearchDk = CreateSolidBrush(DK_SEARCH);
+        EnsureDarkGDI();
     }
 
     /* Register dialog window classes — reuse one struct, vary only proc + name */
