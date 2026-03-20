@@ -1,5 +1,5 @@
 /*
- * simple_launcher.c - Simple Launcher v2.12
+ * simple_launcher.c - Simple Launcher v2.13
  *
  * Features:
  *   - INI-configured buttons with optional icons, separators, admin elevation
@@ -20,7 +20,7 @@
  *   - Profiles - switchable INI sets from tray or Profiles menu
  *   - Environment variables — %VAR% expanded in path, args, and working dir
  *   - Launch mode per button - Normal, Minimized, or Hidden
- *   - Version 2.12
+ *   - Version 2.13
  *
  * Compile:
  *
@@ -200,6 +200,7 @@ static HBRUSH       g_hbrSearchDk  = NULL;
 static HBRUSH       g_hbrDkBtn     = NULL;    /* cached DK_BTN fill brush */
 static HBRUSH       g_hbrDkBtnPre  = NULL;    /* cached DK_BTN_PRE fill brush */
 static HBRUSH       g_hbrDkMenuBg  = NULL;    /* cached DK_MENU_BG brush for RepaintMenuBar */
+static HBRUSH       g_hbrDkMenuHot = NULL;    /* cached DK_MENU_HOT brush for WM_DRAWITEM hover */
 static HPEN         g_hpenDkBorder = NULL;    /* cached DK_BORDER outline pen */
 static HPEN         g_hpenDkSep    = NULL;    /* cached DK_SEP separator pen */
 static HPEN         g_hpenLtSep    = NULL;    /* cached LT_SEP separator pen */
@@ -373,12 +374,13 @@ static void SwitchProfile(int idx)
     g_count = 0;
     memset(g_buttons,   0, sizeof(g_buttons));
     memset(g_collapsed, 0, sizeof(g_collapsed));
-    g_filterText[0] = '\0';
+    g_filterText[0]      = '\0';
+    g_filterTextLower[0] = '\0';
     if (g_hwndSearch) SetWindowText(g_hwndSearch, "");
     LoadSettings();
     LoadButtons();
+    LoadButtonIcons();  /* must run before RefreshMainWindow draws icons */
     RecreateFont();
-    /* LoadButtonIcons called inside RefreshMainWindow */
     ApplyDarkBackground();
     SetTitleBarDark(g_hwndMain, g_darkMode);
     SetWindowText(g_hwndMain, g_winTitle);
@@ -489,7 +491,46 @@ static void SaveAll(void)
 
     /* Write to a temporary file first, then atomically rename it over the
        real INI.  This ensures the INI is never left in a truncated or
-       partially-written state if the process is killed mid-save. */
+       partially-written state if the process is killed mid-save.
+       If the path is too long to append ".tmp", fall back to a direct
+       overwrite so the save still succeeds. */
+    if (strlen(g_iniPath) + 5 >= MAX_PATH) {
+        /* Path too long for a .tmp suffix -- write directly. */
+        FILE *f = fopen(g_iniPath, "w");
+        if (!f) return;
+        fprintf(f, "[Settings]\r\n");
+        fprintf(f, "DarkMode=%d\r\n",         g_darkMode);
+        fprintf(f, "AlwaysOnTop=%d\r\n",      g_alwaysOnTop);
+        fprintf(f, "MinToTray=%d\r\n",        g_minToTray);
+        fprintf(f, "FontSize=%d\r\n",         g_fontSize);
+        fprintf(f, "WindowWidth=%d\r\n",      g_winWidth);
+        fprintf(f, "AdminBorderColor=%d\r\n", (int)g_adminColor);
+        fprintf(f, "WindowX=%d\r\n",          g_winX);
+        fprintf(f, "WindowY=%d\r\n",          g_winY);
+        fprintf(f, "Opacity=%d\r\n",          g_opacity);
+        fprintf(f, "CompactMode=%d\r\n",      g_compactMode);
+        WriteEscaped(f, "WindowTitle",        g_winTitle);
+        fprintf(f, "\r\n");
+        fprintf(f, "[Buttons]\r\n");
+        fprintf(f, "Count=%d\r\n", g_count);
+        for (int i = 0; i < g_count; i++) {
+            fprintf(f, "\r\n");
+            fprintf(f, "[Button%d]\r\n",   i + 1);
+            WriteEscaped(f, "Name",        g_buttons[i].name);
+            WriteEscaped(f, "Path",        g_buttons[i].path);
+            WriteEscaped(f, "Args",        g_buttons[i].args);
+            WriteEscaped(f, "WorkDir",     g_buttons[i].workDir);
+            WriteEscaped(f, "IconPath",    g_buttons[i].iconPath);
+            fprintf(f, "Admin=%d\r\n",      g_buttons[i].admin);
+            fprintf(f, "Separator=%d\r\n",  g_buttons[i].isSeparator);
+            fprintf(f, "IsCategory=%d\r\n", g_buttons[i].isCategory);
+            fprintf(f, "ShowIcon=%d\r\n",   g_buttons[i].showIcon);
+            fprintf(f, "LaunchMode=%d\r\n", g_buttons[i].launchMode);
+        }
+        fclose(f);
+        return;
+    }
+
     char tmpPath[MAX_PATH];
     snprintf(tmpPath, MAX_PATH, "%s.tmp", g_iniPath);
 
@@ -560,6 +601,7 @@ static void EnsureDarkGDI(void)
     if (!g_hbrDkBtn)     g_hbrDkBtn     = CreateSolidBrush(DK_BTN);
     if (!g_hbrDkBtnPre)  g_hbrDkBtnPre  = CreateSolidBrush(DK_BTN_PRE);
     if (!g_hbrDkMenuBg)  g_hbrDkMenuBg  = CreateSolidBrush(DK_MENU_BG);
+    if (!g_hbrDkMenuHot) g_hbrDkMenuHot = CreateSolidBrush(DK_MENU_HOT);
     if (!g_hpenDkBorder) g_hpenDkBorder = CreatePen(PS_SOLID, 1, DK_BORDER);
     if (!g_hpenDkSep)    g_hpenDkSep    = CreatePen(PS_SOLID, 1, DK_SEP);
     if (!g_hpenLtSep)    g_hpenLtSep    = CreatePen(PS_SOLID, 1, LT_SEP);
@@ -572,6 +614,7 @@ static void FreeDarkGDI(void)
     if (g_hbrDkBtn)        { DeleteObject(g_hbrDkBtn);        g_hbrDkBtn        = NULL; }
     if (g_hbrDkBtnPre)     { DeleteObject(g_hbrDkBtnPre);     g_hbrDkBtnPre     = NULL; }
     if (g_hbrDkMenuBg)     { DeleteObject(g_hbrDkMenuBg);     g_hbrDkMenuBg     = NULL; }
+    if (g_hbrDkMenuHot)    { DeleteObject(g_hbrDkMenuHot);    g_hbrDkMenuHot    = NULL; }
     if (g_hpenDkBorder)    { DeleteObject(g_hpenDkBorder);    g_hpenDkBorder    = NULL; }
     if (g_hpenDkSep)       { DeleteObject(g_hpenDkSep);       g_hpenDkSep       = NULL; }
     if (g_hpenLtSep)       { DeleteObject(g_hpenLtSep);       g_hpenLtSep       = NULL; }
@@ -1688,8 +1731,15 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         if (dis->CtlType == ODT_MENU) {
             const char *label = (const char *)dis->itemData;
             BOOL hot = (dis->itemState & (ODS_SELECTED | ODS_HOTLIGHT)) != 0;
-            HBRUSH hbr = CreateSolidBrush(hot ? DK_MENU_HOT : DK_MENU_BG);
-            FillRect(dis->hDC, &dis->rcItem, hbr); DeleteObject(hbr);
+            /* Use cached brushes; no per-hover alloc/free needed. */
+            HBRUSH hbr = hot ? g_hbrDkMenuHot : g_hbrDkMenuBg;
+            if (!hbr) {
+                /* Fallback if EnsureDarkGDI has not run yet. */
+                hbr = CreateSolidBrush(hot ? DK_MENU_HOT : DK_MENU_BG);
+                FillRect(dis->hDC, &dis->rcItem, hbr); DeleteObject(hbr);
+            } else {
+                FillRect(dis->hDC, &dis->rcItem, hbr);
+            }
             SetBkMode(dis->hDC, TRANSPARENT);
             SetTextColor(dis->hDC, DK_TEXT);
             /* Select the same font used in WM_NCPAINT to prevent a size/weight
@@ -1974,7 +2024,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         } else if (id == ID_HELP_ABOUT) {
             ShowInfoDialog(hwnd, "About Simple Launcher",
                 "Simple Launcher\r\n"
-                "Version 2.12\r\n"
+                "Version 2.13\r\n"
                 "\r\n"
                 "Author:   UberGuidoZ\r\n"
                 "Contact:  https://github.com/UberGuidoZ");
@@ -2044,6 +2094,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
 {
     g_hInst = hInstance;
+    /* Initialize COM for the apartment so SHBrowseForFolder with
+       BIF_NEWDIALOGSTYLE and other shell operations work reliably. */
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     InitCommonControls();   /* required to register TOOLTIPS_CLASS and other common controls */
     GetBasePath();
     ScanProfiles();
@@ -2103,5 +2156,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
+    CoUninitialize();
     return (int)msg.wParam;
 }
