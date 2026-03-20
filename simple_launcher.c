@@ -1,5 +1,5 @@
 /*
- * simple_launcher.c - Simple Launcher v2.13
+ * simple_launcher.c - Simple Launcher v2.14
  *
  * Features:
  *   - INI-configured buttons with optional icons, separators, admin elevation
@@ -20,7 +20,7 @@
  *   - Profiles - switchable INI sets from tray or Profiles menu
  *   - Environment variables — %VAR% expanded in path, args, and working dir
  *   - Launch mode per button - Normal, Minimized, or Hidden
- *   - Version 2.13
+ *   - Version 2.14
  *
  * Compile:
  *
@@ -201,6 +201,9 @@ static HBRUSH       g_hbrDkBtn     = NULL;    /* cached DK_BTN fill brush */
 static HBRUSH       g_hbrDkBtnPre  = NULL;    /* cached DK_BTN_PRE fill brush */
 static HBRUSH       g_hbrDkMenuBg  = NULL;    /* cached DK_MENU_BG brush for RepaintMenuBar */
 static HBRUSH       g_hbrDkMenuHot = NULL;    /* cached DK_MENU_HOT brush for WM_DRAWITEM hover */
+static HBRUSH       g_hbrDkCatBg   = NULL;    /* cached DK_CAT_BG category header background */
+static HBRUSH       g_hbrLtCatBg   = NULL;    /* cached LT_CAT_BG category header background */
+static HBRUSH       g_hbrLtCatPre  = NULL;    /* cached pressed light-mode category background */
 static HPEN         g_hpenDkBorder = NULL;    /* cached DK_BORDER outline pen */
 static HPEN         g_hpenDkSep    = NULL;    /* cached DK_SEP separator pen */
 static HPEN         g_hpenLtSep    = NULL;    /* cached LT_SEP separator pen */
@@ -480,62 +483,11 @@ static void WriteEscaped(FILE *f, const char *key, const char *val)
     fputs("\r\n", f);
 }
 
-static void SaveAll(void)
+/* Writes all settings and button data to an already-open file handle.
+   Shared by both branches of SaveAll so there is exactly one copy of the
+   write logic; any field addition or rename only needs to be made here. */
+static void WriteINIBody(FILE *f)
 {
-    if (g_hwndMain) {
-        RECT rc;
-        GetWindowRect(g_hwndMain, &rc);
-        g_winX = rc.left;
-        g_winY = rc.top;
-    }
-
-    /* Write to a temporary file first, then atomically rename it over the
-       real INI.  This ensures the INI is never left in a truncated or
-       partially-written state if the process is killed mid-save.
-       If the path is too long to append ".tmp", fall back to a direct
-       overwrite so the save still succeeds. */
-    if (strlen(g_iniPath) + 5 >= MAX_PATH) {
-        /* Path too long for a .tmp suffix -- write directly. */
-        FILE *f = fopen(g_iniPath, "w");
-        if (!f) return;
-        fprintf(f, "[Settings]\r\n");
-        fprintf(f, "DarkMode=%d\r\n",         g_darkMode);
-        fprintf(f, "AlwaysOnTop=%d\r\n",      g_alwaysOnTop);
-        fprintf(f, "MinToTray=%d\r\n",        g_minToTray);
-        fprintf(f, "FontSize=%d\r\n",         g_fontSize);
-        fprintf(f, "WindowWidth=%d\r\n",      g_winWidth);
-        fprintf(f, "AdminBorderColor=%d\r\n", (int)g_adminColor);
-        fprintf(f, "WindowX=%d\r\n",          g_winX);
-        fprintf(f, "WindowY=%d\r\n",          g_winY);
-        fprintf(f, "Opacity=%d\r\n",          g_opacity);
-        fprintf(f, "CompactMode=%d\r\n",      g_compactMode);
-        WriteEscaped(f, "WindowTitle",        g_winTitle);
-        fprintf(f, "\r\n");
-        fprintf(f, "[Buttons]\r\n");
-        fprintf(f, "Count=%d\r\n", g_count);
-        for (int i = 0; i < g_count; i++) {
-            fprintf(f, "\r\n");
-            fprintf(f, "[Button%d]\r\n",   i + 1);
-            WriteEscaped(f, "Name",        g_buttons[i].name);
-            WriteEscaped(f, "Path",        g_buttons[i].path);
-            WriteEscaped(f, "Args",        g_buttons[i].args);
-            WriteEscaped(f, "WorkDir",     g_buttons[i].workDir);
-            WriteEscaped(f, "IconPath",    g_buttons[i].iconPath);
-            fprintf(f, "Admin=%d\r\n",      g_buttons[i].admin);
-            fprintf(f, "Separator=%d\r\n",  g_buttons[i].isSeparator);
-            fprintf(f, "IsCategory=%d\r\n", g_buttons[i].isCategory);
-            fprintf(f, "ShowIcon=%d\r\n",   g_buttons[i].showIcon);
-            fprintf(f, "LaunchMode=%d\r\n", g_buttons[i].launchMode);
-        }
-        fclose(f);
-        return;
-    }
-
-    char tmpPath[MAX_PATH];
-    snprintf(tmpPath, MAX_PATH, "%s.tmp", g_iniPath);
-
-    FILE *f = fopen(tmpPath, "w");
-    if (!f) return;
     fprintf(f, "[Settings]\r\n");
     fprintf(f, "DarkMode=%d\r\n",         g_darkMode);
     fprintf(f, "AlwaysOnTop=%d\r\n",      g_alwaysOnTop);
@@ -565,6 +517,37 @@ static void SaveAll(void)
         fprintf(f, "ShowIcon=%d\r\n",   g_buttons[i].showIcon);
         fprintf(f, "LaunchMode=%d\r\n", g_buttons[i].launchMode);
     }
+}
+
+static void SaveAll(void)
+{
+    if (g_hwndMain) {
+        RECT rc;
+        GetWindowRect(g_hwndMain, &rc);
+        g_winX = rc.left;
+        g_winY = rc.top;
+    }
+
+    /* Write to a temporary file first, then atomically rename it over the
+       real INI.  This ensures the INI is never left in a truncated or
+       partially-written state if the process is killed mid-save.
+       If the path is too long to append ".tmp", fall back to a direct
+       overwrite so the save still succeeds. */
+    if (strlen(g_iniPath) + 5 >= MAX_PATH) {
+        /* Path too long for a .tmp suffix -- write directly. */
+        FILE *f = fopen(g_iniPath, "w");
+        if (!f) return;
+        WriteINIBody(f);
+        fclose(f);
+        return;
+    }
+
+    char tmpPath[MAX_PATH];
+    snprintf(tmpPath, MAX_PATH, "%s.tmp", g_iniPath);
+
+    FILE *f = fopen(tmpPath, "w");
+    if (!f) return;
+    WriteINIBody(f);
     fclose(f);
 
     /* Atomic replace: the old INI is only overwritten after the new data
@@ -602,6 +585,9 @@ static void EnsureDarkGDI(void)
     if (!g_hbrDkBtnPre)  g_hbrDkBtnPre  = CreateSolidBrush(DK_BTN_PRE);
     if (!g_hbrDkMenuBg)  g_hbrDkMenuBg  = CreateSolidBrush(DK_MENU_BG);
     if (!g_hbrDkMenuHot) g_hbrDkMenuHot = CreateSolidBrush(DK_MENU_HOT);
+    if (!g_hbrDkCatBg)   g_hbrDkCatBg   = CreateSolidBrush(DK_CAT_BG);
+    if (!g_hbrLtCatBg)   g_hbrLtCatBg   = CreateSolidBrush(LT_CAT_BG);
+    if (!g_hbrLtCatPre)  g_hbrLtCatPre  = CreateSolidBrush(RGB(180, 205, 235));
     if (!g_hpenDkBorder) g_hpenDkBorder = CreatePen(PS_SOLID, 1, DK_BORDER);
     if (!g_hpenDkSep)    g_hpenDkSep    = CreatePen(PS_SOLID, 1, DK_SEP);
     if (!g_hpenLtSep)    g_hpenLtSep    = CreatePen(PS_SOLID, 1, LT_SEP);
@@ -615,6 +601,9 @@ static void FreeDarkGDI(void)
     if (g_hbrDkBtnPre)     { DeleteObject(g_hbrDkBtnPre);     g_hbrDkBtnPre     = NULL; }
     if (g_hbrDkMenuBg)     { DeleteObject(g_hbrDkMenuBg);     g_hbrDkMenuBg     = NULL; }
     if (g_hbrDkMenuHot)    { DeleteObject(g_hbrDkMenuHot);    g_hbrDkMenuHot    = NULL; }
+    if (g_hbrDkCatBg)      { DeleteObject(g_hbrDkCatBg);      g_hbrDkCatBg      = NULL; }
+    if (g_hbrLtCatBg)      { DeleteObject(g_hbrLtCatBg);      g_hbrLtCatBg      = NULL; }
+    if (g_hbrLtCatPre)     { DeleteObject(g_hbrLtCatPre);     g_hbrLtCatPre     = NULL; }
     if (g_hpenDkBorder)    { DeleteObject(g_hpenDkBorder);    g_hpenDkBorder    = NULL; }
     if (g_hpenDkSep)       { DeleteObject(g_hpenDkSep);       g_hpenDkSep       = NULL; }
     if (g_hpenLtSep)       { DeleteObject(g_hpenLtSep);       g_hpenLtSep       = NULL; }
@@ -695,10 +684,14 @@ static void DrawButton(LPDRAWITEMSTRUCT dis, int idx)
 
     /* ── Category header ── */
     if (idx >= 0 && idx < g_count && g_buttons[idx].isCategory) {
-        COLORREF bg   = g_darkMode ? DK_CAT_BG  : LT_CAT_BG;
         COLORREF text = g_darkMode ? DK_CAT_TEXT : LT_CAT_TEXT;
-        HBRUSH hbr = CreateSolidBrush(pressed ? (g_darkMode ? DK_BTN_PRE : RGB(180,205,235)) : bg);
-        FillRect(dis->hDC, &rc, hbr); DeleteObject(hbr);
+        /* Use cached brushes; no per-paint alloc/free needed. */
+        HBRUSH hbr;
+        if (pressed)
+            hbr = g_darkMode ? g_hbrDkBtnPre : g_hbrLtCatPre;
+        else
+            hbr = g_darkMode ? g_hbrDkCatBg : g_hbrLtCatBg;
+        FillRect(dis->hDC, &rc, hbr);
         const char *arrow = g_collapsed[idx] ? ">" : "v";
         SetBkMode(dis->hDC, TRANSPARENT);
         SetTextColor(dis->hDC, text);
@@ -2024,7 +2017,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         } else if (id == ID_HELP_ABOUT) {
             ShowInfoDialog(hwnd, "About Simple Launcher",
                 "Simple Launcher\r\n"
-                "Version 2.13\r\n"
+                "Version 2.14\r\n"
                 "\r\n"
                 "Author:   UberGuidoZ\r\n"
                 "Contact:  https://github.com/UberGuidoZ");
@@ -2107,8 +2100,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     if (g_darkMode) {
         g_hbrDkBg     = CreateSolidBrush(DK_BG);
         g_hbrSearchDk = CreateSolidBrush(DK_SEARCH);
-        EnsureDarkGDI();
     }
+    /* Always create the shared cached GDI objects; category header brushes
+       are needed in both dark and light mode. */
+    EnsureDarkGDI();
 
     /* Register dialog window classes — reuse one struct, vary only proc + name */
     WNDCLASS wcd = {0};
@@ -2151,7 +2146,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     UpdateWindow(g_hwndMain);
 
     MSG msg = {0};
-    while (GetMessage(&msg, NULL, 0, 0)) {
+    while (GetMessage(&msg, NULL, 0, 0) > 0) {
         if (g_hwndDlg && IsDialogMessage(g_hwndDlg, &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessage(&msg);
