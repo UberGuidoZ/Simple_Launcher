@@ -1,5 +1,5 @@
 /*
- * simple_launcher.c - Simple Launcher v2.10
+ * simple_launcher.c - Simple Launcher v2.11
  *
  * Features:
  *   - INI-configured buttons with optional icons, separators, admin elevation
@@ -20,9 +20,10 @@
  *   - Profiles - switchable INI sets from tray or Profiles menu
  *   - Environment variables — %VAR% expanded in path, args, and working dir
  *   - Launch mode per button - Normal, Minimized, or Hidden
- *   - Version 2.10
+ *   - Version 2.11
  *
  * Compile:
+ *
  *   cl simple_launcher.c simple_launcher.res /link user32.lib shell32.lib comdlg32.lib gdi32.lib dwmapi.lib ole32.lib comctl32.lib /subsystem:windows /out:simple_launcher.exe
  */
 
@@ -201,6 +202,8 @@ static HBRUSH       g_hbrDkBtnPre  = NULL;    /* cached DK_BTN_PRE fill brush */
 static HPEN         g_hpenDkBorder = NULL;    /* cached DK_BORDER outline pen */
 static HPEN         g_hpenDkSep    = NULL;    /* cached DK_SEP separator pen */
 static HPEN         g_hpenLtSep    = NULL;    /* cached LT_SEP separator pen */
+static HPEN         g_hpenAdminBorder = NULL; /* cached admin border pen */
+static COLORREF     g_hpenAdminColor  = (COLORREF)-1; /* tracks color used for the cached pen */
 static HFONT        g_hFont        = NULL;
 static HFONT        g_hFontBold    = NULL;   /* bold font for category headers */
 static int          g_trayAdded    = 0;
@@ -229,6 +232,11 @@ static const char  *g_infoDlgContent = NULL;
 /* Tooltips */
 static HWND  g_hwndTooltip = NULL;
 static char  g_tooltipText[MAX_BUTTONS][384];
+
+/* Precomputed lowercase button names for fast filter matching.
+   Rebuilt once at the top of RefreshMainWindow instead of re-lowercasing
+   every name on every keystroke inside ButtonMatchesFilter. */
+static char  g_buttonNamesLower[MAX_BUTTONS][256];
 
 /* ── DWM dark title bar ──────────────────────────────────────────────── */
 static void SetTitleBarDark(HWND hwnd, int dark)
@@ -299,7 +307,7 @@ static void GetBasePath(void)
     GetModuleFileName(NULL, g_basePath, MAX_PATH);
     char *dot = strrchr(g_basePath, '.');
     if (dot) {
-        if ((dot - g_basePath) + 5 <= MAX_PATH)
+        if ((dot - g_basePath) + 5 < MAX_PATH)
             strcpy(dot, ".ini");
     } else {
         size_t len = strlen(g_basePath);
@@ -451,13 +459,15 @@ static void LoadButtons(void)
     }
 }
 
-/* Writes key=value to f, replacing any CR or LF in value with a space.
-   This prevents a user-supplied string from injecting extra INI sections. */
+/* Writes key=value to f, replacing any CR, LF, or '[' in value with a space.
+   CR/LF prevent a user-supplied string from injecting extra INI lines.
+   '[' prevents a value from being mis-parsed as a section header by some
+   INI readers if it appears at the start of a line after line continuation. */
 static void WriteEscaped(FILE *f, const char *key, const char *val)
 {
     fprintf(f, "%s=", key);
     for (; *val; val++)
-        fputc((*val == '\r' || *val == '\n') ? ' ' : *val, f);
+        fputc((*val == '\r' || *val == '\n' || *val == '[') ? ' ' : *val, f);
     fputs("\r\n", f);
 }
 
@@ -469,7 +479,14 @@ static void SaveAll(void)
         g_winX = rc.left;
         g_winY = rc.top;
     }
-    FILE *f = fopen(g_iniPath, "w");
+
+    /* Write to a temporary file first, then atomically rename it over the
+       real INI.  This ensures the INI is never left in a truncated or
+       partially-written state if the process is killed mid-save. */
+    char tmpPath[MAX_PATH];
+    snprintf(tmpPath, MAX_PATH, "%s.tmp", g_iniPath);
+
+    FILE *f = fopen(tmpPath, "w");
     if (!f) return;
     fprintf(f, "[Settings]\r\n");
     fprintf(f, "DarkMode=%d\r\n",         g_darkMode);
@@ -501,6 +518,11 @@ static void SaveAll(void)
         fprintf(f, "LaunchMode=%d\r\n", g_buttons[i].launchMode);
     }
     fclose(f);
+
+    /* Atomic replace: the old INI is only overwritten after the new data
+       has been fully flushed and closed. */
+    MoveFileEx(tmpPath, g_iniPath,
+               MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
 }
 
 /* ── Environment variable expansion ─────────────────────────────────── */
@@ -539,11 +561,32 @@ static void EnsureDarkGDI(void)
    off or on application shutdown. */
 static void FreeDarkGDI(void)
 {
-    if (g_hbrDkBtn)     { DeleteObject(g_hbrDkBtn);     g_hbrDkBtn     = NULL; }
-    if (g_hbrDkBtnPre)  { DeleteObject(g_hbrDkBtnPre);  g_hbrDkBtnPre  = NULL; }
-    if (g_hpenDkBorder) { DeleteObject(g_hpenDkBorder); g_hpenDkBorder = NULL; }
-    if (g_hpenDkSep)    { DeleteObject(g_hpenDkSep);    g_hpenDkSep    = NULL; }
-    if (g_hpenLtSep)    { DeleteObject(g_hpenLtSep);    g_hpenLtSep    = NULL; }
+    if (g_hbrDkBtn)        { DeleteObject(g_hbrDkBtn);        g_hbrDkBtn        = NULL; }
+    if (g_hbrDkBtnPre)     { DeleteObject(g_hbrDkBtnPre);     g_hbrDkBtnPre     = NULL; }
+    if (g_hpenDkBorder)    { DeleteObject(g_hpenDkBorder);    g_hpenDkBorder    = NULL; }
+    if (g_hpenDkSep)       { DeleteObject(g_hpenDkSep);       g_hpenDkSep       = NULL; }
+    if (g_hpenLtSep)       { DeleteObject(g_hpenLtSep);       g_hpenLtSep       = NULL; }
+    if (g_hpenAdminBorder) { DeleteObject(g_hpenAdminBorder); g_hpenAdminBorder = NULL;
+                             g_hpenAdminColor = (COLORREF)-1; }
+}
+
+/* Shared icon-loading helper used by both LoadButtonIcons and
+   LoadSingleButtonIcon.  Frees any existing icon in slot i before loading. */
+static void LoadIconForSlot(int i)
+{
+    if (g_icons[i]) { DestroyIcon(g_icons[i]); g_icons[i] = NULL; }
+    if (!g_buttons[i].showIcon || g_buttons[i].isSeparator) return;
+    const char *src = g_buttons[i].iconPath[0] ? g_buttons[i].iconPath
+                                                : g_buttons[i].path;
+    if (!src[0]) return;
+    /* Try loading as a standalone .ico / .png first */
+    HICON hIco = (HICON)LoadImage(NULL, src, IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
+    if (hIco) { g_icons[i] = hIco; return; }
+    /* Fall back to extracting from .exe */
+    HICON hLg = NULL, hSm = NULL;
+    ExtractIconEx(src, 0, &hLg, &hSm, 1);
+    if (hSm)      { g_icons[i] = hSm; if (hLg) DestroyIcon(hLg); }
+    else if (hLg) { g_icons[i] = hLg; }
 }
 
 /* Loads or reloads the icon for a single button slot.
@@ -552,40 +595,14 @@ static void FreeDarkGDI(void)
 static void LoadSingleButtonIcon(int i)
 {
     if (i < 0 || i >= MAX_BUTTONS) return;
-    if (g_icons[i]) { DestroyIcon(g_icons[i]); g_icons[i] = NULL; }
-    if (!g_buttons[i].showIcon || g_buttons[i].isSeparator) return;
-    const char *src = g_buttons[i].iconPath[0] ? g_buttons[i].iconPath
-                                                : g_buttons[i].path;
-    if (!src[0]) return;
-    HICON hIco = (HICON)LoadImage(NULL, src, IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
-    if (hIco) { g_icons[i] = hIco; return; }
-    HICON hLg = NULL, hSm = NULL;
-    ExtractIconEx(src, 0, &hLg, &hSm, 1);
-    if (hSm) { g_icons[i] = hSm; if (hLg) DestroyIcon(hLg); }
-    else if (hLg) { g_icons[i] = hLg; }
+    LoadIconForSlot(i);
 }
 
 static void LoadButtonIcons(void)
 {
     FreeIcons();
-    for (int i = 0; i < g_count; i++) {
-        if (!g_buttons[i].showIcon || g_buttons[i].isSeparator) continue;
-
-        const char *src = g_buttons[i].iconPath[0] ? g_buttons[i].iconPath
-                                                    : g_buttons[i].path;
-        if (!src[0]) continue;
-
-        /* Try loading as a standalone .ico / .png first */
-        HICON hIco = (HICON)LoadImage(NULL, src, IMAGE_ICON,
-                                      16, 16, LR_LOADFROMFILE);
-        if (hIco) { g_icons[i] = hIco; continue; }
-
-        /* Fall back to extracting from .exe */
-        HICON hLg = NULL, hSm = NULL;
-        ExtractIconEx(src, 0, &hLg, &hSm, 1);
-        if (hSm) { g_icons[i] = hSm; if (hLg) DestroyIcon(hLg); }
-        else if (hLg) { g_icons[i] = hLg; }
-    }
+    for (int i = 0; i < g_count; i++)
+        LoadIconForSlot(i);
 }
 
 /* ── Owner-draw ──────────────────────────────────────────────────────── */
@@ -672,13 +689,18 @@ static void DrawButton(LPDRAWITEMSTRUCT dis, int idx)
         DrawEdge(dis->hDC, &rc, pressed ? EDGE_SUNKEN : EDGE_RAISED, BF_RECT);
     }
     if (isAdmin) {
-        /* Admin border pen is per-call because its color is user-configurable. */
-        HPEN   hPen  = CreatePen(PS_SOLID, 2, g_adminColor);
-        HPEN   hOldP = (HPEN)SelectObject(dis->hDC, hPen);
+        /* Cache the admin border pen; recreate only when g_adminColor changes
+           because its color is user-configurable. */
+        if (!g_hpenAdminBorder || g_hpenAdminColor != g_adminColor) {
+            if (g_hpenAdminBorder) DeleteObject(g_hpenAdminBorder);
+            g_hpenAdminBorder = CreatePen(PS_SOLID, 2, g_adminColor);
+            g_hpenAdminColor  = g_adminColor;
+        }
+        HPEN   hOldP = (HPEN)SelectObject(dis->hDC, g_hpenAdminBorder);
         HBRUSH hNull = (HBRUSH)SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
         RECT   inner = { rc.left+3, rc.top+3, rc.right-3, rc.bottom-3 };
         Rectangle(dis->hDC, inner.left, inner.top, inner.right, inner.bottom);
-        SelectObject(dis->hDC, hOldP); SelectObject(dis->hDC, hNull); DeleteObject(hPen);
+        SelectObject(dis->hDC, hOldP); SelectObject(dis->hDC, hNull);
     }
     int textLeft = rc.left;
     if (idx >= 0 && idx < g_count && g_icons[idx]) {
@@ -731,23 +753,38 @@ static void RebuildMenu(void)
 }
 
 /* ── Filter helper ───────────────────────────────────────────────────── */
+
+/* Rebuilds the precomputed lowercase name table.  Called once per layout
+   pass so ButtonMatchesFilter never re-lowercases on every keystroke. */
+static void RebuildFilterCache(void)
+{
+    for (int i = 0; i < g_count; i++) {
+        int j = 0;
+        for (const char *p = g_buttons[i].name; *p && j < 255; p++)
+            g_buttonNamesLower[i][j++] = (char)tolower((unsigned char)*p);
+        g_buttonNamesLower[i][j] = '\0';
+    }
+}
+
 static int ButtonMatchesFilter(int i)
 {
     if (!g_filterText[0]) return 1;
     if (g_buttons[i].isSeparator || g_buttons[i].isCategory) return 0;
-    char hay[256], ndl[256]; int hi = 0, ni = 0;
-    for (const char *p = g_buttons[i].name; *p && hi < 255; p++)
-        hay[hi++] = (char)tolower((unsigned char)*p);
-    hay[hi] = '\0';
+    /* Use the precomputed lowercase name; only lowercase the short filter
+       text here, which is at most 255 chars typed by the user. */
+    char ndl[256]; int ni = 0;
     for (const char *p = g_filterText; *p && ni < 255; p++)
         ndl[ni++] = (char)tolower((unsigned char)*p);
     ndl[ni] = '\0';
-    return (strstr(hay, ndl) != NULL) ? 1 : 0;
+    return (strstr(g_buttonNamesLower[i], ndl) != NULL) ? 1 : 0;
 }
 
 /* ── Layout ──────────────────────────────────────────────────────────── */
 static void RefreshMainWindow(void)
 {
+    /* Rebuild the lowercase name cache before any filtering occurs. */
+    RebuildFilterCache();
+
     for (int i = 0; i < MAX_BUTTONS; i++) {
         if (g_hwndBtns[i]) { DestroyWindow(g_hwndBtns[i]); g_hwndBtns[i] = NULL; }
     }
@@ -1543,7 +1580,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             ShowWindow(hwnd, SW_HIDE);
             AddTrayIcon();
         } else {
-            SaveAll();
+            /* SaveAll() is called inside WM_DESTROY; do not call it here
+               to avoid writing the INI twice on a normal close. */
             DestroyWindow(hwnd);
         }
         return 0;
@@ -1780,7 +1818,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             if (!hPr) return 0;
             g_hwndDlg = hPr; SetTitleBarDark(hPr, g_darkMode);
             ShowWindow(hPr, SW_SHOW); UpdateWindow(hPr);
-            MSG pmsg;
+            MSG pmsg = {0};
             /* GetMessage returns 0 on WM_QUIT; re-post it so the main loop exits. */
             while (!g_promptDone && GetMessage(&pmsg, NULL, 0, 0) > 0) {
                 if (IsWindow(hPr) && IsDialogMessage(hPr, &pmsg)) continue;
@@ -1798,7 +1836,11 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 char safe[64]; int si = 0;
                 for (int i = 0; g_promptResult[i] && si < 63; i++) {
                     unsigned char c = (unsigned char)g_promptResult[i];
-                    if (c < 32) continue;       /* strip control characters */
+                    /* Allow only printable ASCII (32-126); this also rejects
+                       all high-byte multi-byte sequences that could be split
+                       at the 63-char truncation boundary and misinterpreted
+                       by Windows ANSI file APIs. */
+                    if (c < 32 || c > 126) continue;
                     if (c == '.') continue;      /* block dot to prevent ".." etc. */
                     if (c == '/' || c == '\\' || c == ':' || c == '*' ||
                         c == '?' || c == '"'  || c == '<' || c == '>' || c == '|')
@@ -1852,7 +1894,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             }
 
         } else if (id == ID_OPEN_INI) {
-            ShellExecute(NULL, "open", "notepad.exe", g_iniPath, NULL, SW_SHOW);
+            /* Use the fully-qualified system Notepad path to prevent a
+               rogue notepad.exe earlier on %PATH% from being executed. */
+            char notepadPath[MAX_PATH];
+            ExpandEnvironmentStrings("%SystemRoot%\\system32\\notepad.exe",
+                                     notepadPath, MAX_PATH);
+            ShellExecute(NULL, "open", notepadPath, g_iniPath, NULL, SW_SHOW);
 
         } else if (id == ID_HELP_INSTRUCTIONS) {
             ShowInfoDialog(hwnd, "Instructions",
@@ -1915,7 +1962,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         } else if (id == ID_HELP_ABOUT) {
             ShowInfoDialog(hwnd, "About Simple Launcher",
                 "Simple Launcher\r\n"
-                "Version 2.10\r\n"
+                "Version 2.11\r\n"
                 "\r\n"
                 "Author:   UberGuidoZ\r\n"
                 "Contact:  https://github.com/UberGuidoZ");
