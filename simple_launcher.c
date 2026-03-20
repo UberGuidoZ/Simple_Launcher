@@ -1,5 +1,5 @@
 /*
- * simple_launcher.c - Simple Launcher v2.11
+ * simple_launcher.c - Simple Launcher v2.12
  *
  * Features:
  *   - INI-configured buttons with optional icons, separators, admin elevation
@@ -20,7 +20,7 @@
  *   - Profiles - switchable INI sets from tray or Profiles menu
  *   - Environment variables — %VAR% expanded in path, args, and working dir
  *   - Launch mode per button - Normal, Minimized, or Hidden
- *   - Version 2.11
+ *   - Version 2.12
  *
  * Compile:
  *
@@ -199,6 +199,7 @@ static HBRUSH       g_hbrDkBg      = NULL;
 static HBRUSH       g_hbrSearchDk  = NULL;
 static HBRUSH       g_hbrDkBtn     = NULL;    /* cached DK_BTN fill brush */
 static HBRUSH       g_hbrDkBtnPre  = NULL;    /* cached DK_BTN_PRE fill brush */
+static HBRUSH       g_hbrDkMenuBg  = NULL;    /* cached DK_MENU_BG brush for RepaintMenuBar */
 static HPEN         g_hpenDkBorder = NULL;    /* cached DK_BORDER outline pen */
 static HPEN         g_hpenDkSep    = NULL;    /* cached DK_SEP separator pen */
 static HPEN         g_hpenLtSep    = NULL;    /* cached LT_SEP separator pen */
@@ -237,6 +238,11 @@ static char  g_tooltipText[MAX_BUTTONS][384];
    Rebuilt once at the top of RefreshMainWindow instead of re-lowercasing
    every name on every keystroke inside ButtonMatchesFilter. */
 static char  g_buttonNamesLower[MAX_BUTTONS][256];
+
+/* Precomputed lowercase version of g_filterText.
+   Updated once per EN_CHANGE so ButtonMatchesFilter never lowercases the
+   same filter string once per button per keystroke. */
+static char  g_filterTextLower[256] = "";
 
 /* ── DWM dark title bar ──────────────────────────────────────────────── */
 static void SetTitleBarDark(HWND hwnd, int dark)
@@ -439,6 +445,7 @@ static void LoadSettings(void)
 static void LoadButtons(void)
 {
     g_count = GetPrivateProfileInt("Buttons", "Count", 0, g_iniPath);
+    if (g_count < 0)           g_count = 0;
     if (g_count > MAX_BUTTONS) g_count = MAX_BUTTONS;
     for (int i = 0; i < g_count; i++) {
         char sec[32];
@@ -552,6 +559,7 @@ static void EnsureDarkGDI(void)
 {
     if (!g_hbrDkBtn)     g_hbrDkBtn     = CreateSolidBrush(DK_BTN);
     if (!g_hbrDkBtnPre)  g_hbrDkBtnPre  = CreateSolidBrush(DK_BTN_PRE);
+    if (!g_hbrDkMenuBg)  g_hbrDkMenuBg  = CreateSolidBrush(DK_MENU_BG);
     if (!g_hpenDkBorder) g_hpenDkBorder = CreatePen(PS_SOLID, 1, DK_BORDER);
     if (!g_hpenDkSep)    g_hpenDkSep    = CreatePen(PS_SOLID, 1, DK_SEP);
     if (!g_hpenLtSep)    g_hpenLtSep    = CreatePen(PS_SOLID, 1, LT_SEP);
@@ -563,6 +571,7 @@ static void FreeDarkGDI(void)
 {
     if (g_hbrDkBtn)        { DeleteObject(g_hbrDkBtn);        g_hbrDkBtn        = NULL; }
     if (g_hbrDkBtnPre)     { DeleteObject(g_hbrDkBtnPre);     g_hbrDkBtnPre     = NULL; }
+    if (g_hbrDkMenuBg)     { DeleteObject(g_hbrDkMenuBg);     g_hbrDkMenuBg     = NULL; }
     if (g_hpenDkBorder)    { DeleteObject(g_hpenDkBorder);    g_hpenDkBorder    = NULL; }
     if (g_hpenDkSep)       { DeleteObject(g_hpenDkSep);       g_hpenDkSep       = NULL; }
     if (g_hpenLtSep)       { DeleteObject(g_hpenLtSep);       g_hpenLtSep       = NULL; }
@@ -662,9 +671,10 @@ static void DrawButton(LPDRAWITEMSTRUCT dis, int idx)
 
     /* ── Separator ── */
     if (idx >= 0 && idx < g_count && g_buttons[idx].isSeparator) {
-        COLORREF bgCol = g_darkMode ? DK_BG : GetSysColor(COLOR_BTNFACE);
-        HBRUSH hbr = CreateSolidBrush(bgCol);
-        FillRect(dis->hDC, &rc, hbr); DeleteObject(hbr);
+        /* Reuse the cached dark background brush; light mode uses the stock
+           system brush -- neither requires a per-paint alloc/free. */
+        HBRUSH hbr = g_darkMode ? g_hbrDkBg : (HBRUSH)(COLOR_BTNFACE + 1);
+        FillRect(dis->hDC, &rc, hbr);
         int midY = (rc.top + rc.bottom) / 2;
         EnsureDarkGDI();
         HPEN hOld = (HPEN)SelectObject(dis->hDC,
@@ -770,13 +780,8 @@ static int ButtonMatchesFilter(int i)
 {
     if (!g_filterText[0]) return 1;
     if (g_buttons[i].isSeparator || g_buttons[i].isCategory) return 0;
-    /* Use the precomputed lowercase name; only lowercase the short filter
-       text here, which is at most 255 chars typed by the user. */
-    char ndl[256]; int ni = 0;
-    for (const char *p = g_filterText; *p && ni < 255; p++)
-        ndl[ni++] = (char)tolower((unsigned char)*p);
-    ndl[ni] = '\0';
-    return (strstr(g_buttonNamesLower[i], ndl) != NULL) ? 1 : 0;
+    /* Both sides are precomputed lowercase; no per-call allocation needed. */
+    return (strstr(g_buttonNamesLower[i], g_filterTextLower) != NULL) ? 1 : 0;
 }
 
 /* ── Layout ──────────────────────────────────────────────────────────── */
@@ -1539,7 +1544,9 @@ static void RepaintMenuBar(HWND hwnd)
     HDC hdc = GetWindowDC(hwnd);
     RECT rcBar = { mbiBar.rcBar.left   - rcWin.left, mbiBar.rcBar.top    - rcWin.top,
                    mbiBar.rcBar.right  - rcWin.left, mbiBar.rcBar.bottom - rcWin.top };
-    HBRUSH hbr = CreateSolidBrush(DK_MENU_BG); FillRect(hdc, &rcBar, hbr); DeleteObject(hbr);
+    HBRUSH hbr = g_hbrDkMenuBg ? g_hbrDkMenuBg : CreateSolidBrush(DK_MENU_BG);
+    FillRect(hdc, &rcBar, hbr);
+    if (!g_hbrDkMenuBg) DeleteObject(hbr); /* only free if we had to create a fallback */
     SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, DK_TEXT);
     HFONT hOld = (HFONT)SelectObject(hdc, (HFONT)GetStockObject(DEFAULT_GUI_FONT));
     int n = sizeof(g_menuLabels) / sizeof(g_menuLabels[0]);
@@ -1614,7 +1621,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             if (cmd == IDM_TRAY_RESTORE) {
                 RemoveTrayIcon(); ShowWindow(hwnd, SW_RESTORE); SetForegroundWindow(hwnd);
             } else if (cmd == IDM_TRAY_EXIT) {
-                RemoveTrayIcon(); SaveAll(); DestroyWindow(hwnd);
+                RemoveTrayIcon(); DestroyWindow(hwnd); /* SaveAll() runs in WM_DESTROY */
             } else if (cmd >= IDM_PROFILE_BASE && cmd < IDM_PROFILE_BASE + g_profileCount) {
                 SwitchProfile(cmd - IDM_PROFILE_BASE);
             } else if (cmd == IDM_PROFILE_NEW) {
@@ -1707,6 +1714,11 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         /* Search bar */
         if (id == IDC_SEARCH_EDIT && notif == EN_CHANGE) {
             GetWindowText(g_hwndSearch, g_filterText, sizeof(g_filterText));
+            /* Keep the precomputed lowercase copy in sync. */
+            int fi = 0;
+            for (const char *p = g_filterText; *p && fi < 255; p++)
+                g_filterTextLower[fi++] = (char)tolower((unsigned char)*p);
+            g_filterTextLower[fi] = '\0';
             ApplyFilter();
             return 0;
         }
@@ -1962,7 +1974,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         } else if (id == ID_HELP_ABOUT) {
             ShowInfoDialog(hwnd, "About Simple Launcher",
                 "Simple Launcher\r\n"
-                "Version 2.11\r\n"
+                "Version 2.12\r\n"
                 "\r\n"
                 "Author:   UberGuidoZ\r\n"
                 "Contact:  https://github.com/UberGuidoZ");
@@ -2073,6 +2085,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
                               WS_OVERLAPPEDWINDOW,
                               startX, startY, g_winWidth + 22, 120,
                               NULL, NULL, hInstance, NULL);
+    if (!g_hwndMain) return 1;
 
     RebuildMenu();
     RefreshMainWindow();
@@ -2084,7 +2097,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     ShowWindow(g_hwndMain, nShow);
     UpdateWindow(g_hwndMain);
 
-    MSG msg;
+    MSG msg = {0};
     while (GetMessage(&msg, NULL, 0, 0)) {
         if (g_hwndDlg && IsDialogMessage(g_hwndDlg, &msg)) continue;
         TranslateMessage(&msg);
