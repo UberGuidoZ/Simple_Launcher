@@ -1,5 +1,5 @@
 /*
- * simple_launcher.c - Simple Launcher v2.16
+ * simple_launcher.c - Simple Launcher v2.17
  *
  * Features:
  *   - INI-configured buttons with optional icons, separators, admin elevation
@@ -12,7 +12,6 @@
  *   - Remembers last window position
  *   - Tooltips showing path, args, and working directory on hover
  *   - Working directory field per button
- *   - Open INI in Notepad from menu bar
  *   - Categories - collapsible group headers to organise buttons
  *   - Search / filter bar - type to instantly filter buttons by name
  *   - Compact mode - icon-only grid palette for a tiny always-on-top layout
@@ -21,7 +20,8 @@
  *   - Environment variables - %VAR% expanded in path, args, and working dir
  *   - Launch mode per button - Normal, Minimized, or Hidden
  *   - Drag-and-drop button reordering in the normal list view
- *   - Version 2.16
+ *   - Export / Import buttons to and from a portable INI snippet file
+ *   - Version 2.17
  *
  * Compile:
  *
@@ -69,6 +69,9 @@ static void RecreateFont(void);
 static void SetTitleBarDark(HWND hwnd, int dark);
 static void ScanProfiles(void);
 static void SwitchProfile(int idx);
+static void WriteEscaped(FILE *f, const char *key, const char *val);
+static void ExportButtons(void);
+static void ImportButtons(void);
 static int  DropSlotFromClientY(int cy);
 static void DrawDropLine(int dropIdx);
 static LRESULT CALLBACK ButtonSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
@@ -121,8 +124,9 @@ static LRESULT CALLBACK ButtonSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
 #define ID_HELP_INSTRUCTIONS  20
 #define ID_HELP_ABOUT         21
 #define ID_SETTINGS           22
-#define ID_OPEN_INI           23
 #define ID_PROFILES_MENU      24
+#define ID_EXPORT_BUTTONS     25
+#define ID_IMPORT_BUTTONS     26
 
 /* Right-click context menu */
 #define IDM_MOVE_UP           300
@@ -160,8 +164,8 @@ static LRESULT CALLBACK ButtonSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
 #define DK_CAT_TEXT RGB(200, 225, 255)
 #define LT_CAT_TEXT RGB( 20,  50, 100)
 
-static const char *g_menuLabels[] = { "Instructions", "Settings", "Profiles", "Open INI", "About" };
-static const UINT  g_menuIDs[]    = { ID_HELP_INSTRUCTIONS, ID_SETTINGS, ID_PROFILES_MENU, ID_OPEN_INI, ID_HELP_ABOUT };
+static const char *g_menuLabels[] = { "Instructions", "Settings", "Profiles", "About" };
+static const UINT  g_menuIDs[]    = { ID_HELP_INSTRUCTIONS, ID_SETTINGS, ID_PROFILES_MENU, ID_HELP_ABOUT };
 
 /* ── Data ────────────────────────────────────────────────────────────── */
 typedef struct {
@@ -436,6 +440,9 @@ static void ShowProfilesMenu(HWND hwnd, int x, int y)
     AppendMenu(hM, MF_STRING, IDM_PROFILE_NEW, "New Profile...");
     AppendMenu(hM, MF_STRING | (g_activeProfile == 0 ? MF_GRAYED : 0),
                IDM_PROFILE_DELETE, "Delete Current Profile");
+    AppendMenu(hM, MF_SEPARATOR, 0, NULL);
+    AppendMenu(hM, MF_STRING, ID_EXPORT_BUTTONS, "Export Buttons...");
+    AppendMenu(hM, MF_STRING, ID_IMPORT_BUTTONS, "Import Buttons...");
     SetForegroundWindow(hwnd);
     TrackPopupMenu(hM, TPM_LEFTBUTTON, x, y, 0, hwnd, NULL);
     DestroyMenu(hM);
@@ -591,6 +598,123 @@ static void SaveAll(void)
        has been fully flushed and closed. */
     MoveFileEx(tmpPath, g_iniPath,
                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+}
+
+/* ── Export / Import ─────────────────────────────────────────────────── */
+
+/* Writes the currently loaded buttons to a user-chosen .ini file using the
+   same [Button1]..[ButtonN] format as the main profile INI. The exported
+   file contains only the [Buttons] section -- no [Settings] block -- so it
+   can be shared and imported into any profile without overwriting settings. */
+static void ExportButtons(void)
+{
+    if (g_count == 0) {
+        MessageBox(g_hwndMain, "There are no buttons to export.", "Export", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    OPENFILENAME ofn;
+    char path[MAX_PATH] = "launcher_export.ini";
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner   = g_hwndMain;
+    ofn.lpstrFile   = path;
+    ofn.nMaxFile    = MAX_PATH;
+    ofn.lpstrFilter = "INI files (*.ini)\0*.ini\0All Files\0*.*\0";
+    ofn.lpstrDefExt = "ini";
+    ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    if (!GetSaveFileName(&ofn)) return;
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        MessageBox(g_hwndMain, "Could not create the export file.", "Export", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    fprintf(f, "[Buttons]\r\nCount=%d\r\n", g_count);
+    for (int i = 0; i < g_count; i++) {
+        fprintf(f, "\r\n[Button%d]\r\n", i + 1);
+        WriteEscaped(f, "Name",     g_buttons[i].name);
+        WriteEscaped(f, "Path",     g_buttons[i].path);
+        WriteEscaped(f, "Args",     g_buttons[i].args);
+        WriteEscaped(f, "WorkDir",  g_buttons[i].workDir);
+        WriteEscaped(f, "IconPath", g_buttons[i].iconPath);
+        fprintf(f, "Admin=%d\r\n",       g_buttons[i].admin);
+        fprintf(f, "Separator=%d\r\n",   g_buttons[i].isSeparator);
+        fprintf(f, "IsCategory=%d\r\n",  g_buttons[i].isCategory);
+        fprintf(f, "ShowIcon=%d\r\n",    g_buttons[i].showIcon);
+        fprintf(f, "LaunchMode=%d\r\n",  g_buttons[i].launchMode);
+    }
+    fclose(f);
+
+    char msg[MAX_PATH + 64];
+    snprintf(msg, sizeof(msg), "Exported %d button(s) to:\n%s", g_count, path);
+    MessageBox(g_hwndMain, msg, "Export", MB_OK | MB_ICONINFORMATION);
+}
+
+/* Reads buttons from a user-chosen export file and appends them after the
+   existing buttons. Buttons that would exceed MAX_BUTTONS are skipped and
+   the user is informed. */
+static void ImportButtons(void)
+{
+    OPENFILENAME ofn;
+    char path[MAX_PATH] = "";
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner   = g_hwndMain;
+    ofn.lpstrFile   = path;
+    ofn.nMaxFile    = MAX_PATH;
+    ofn.lpstrFilter = "INI files (*.ini)\0*.ini\0All Files\0*.*\0";
+    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (!GetOpenFileName(&ofn)) return;
+
+    int importCount = GetPrivateProfileInt("Buttons", "Count", 0, path);
+    if (importCount <= 0) {
+        MessageBox(g_hwndMain, "No buttons found in that file.", "Import", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    int added = 0, skipped = 0;
+    for (int i = 0; i < importCount; i++) {
+        if (g_count >= MAX_BUTTONS) { skipped++; continue; }
+
+        char sec[32];
+        snprintf(sec, sizeof(sec), "Button%d", i + 1);
+
+        ButtonConfig bc;
+        memset(&bc, 0, sizeof(bc));
+        GetPrivateProfileString(sec, "Name",     "", bc.name,     256,      path);
+        GetPrivateProfileString(sec, "Path",     "", bc.path,     MAX_PATH, path);
+        GetPrivateProfileString(sec, "Args",     "", bc.args,     512,      path);
+        GetPrivateProfileString(sec, "WorkDir",  "", bc.workDir,  MAX_PATH, path);
+        GetPrivateProfileString(sec, "IconPath", "", bc.iconPath, MAX_PATH, path);
+        bc.admin       = GetPrivateProfileInt(sec, "Admin",      0, path);
+        bc.isSeparator = GetPrivateProfileInt(sec, "Separator",  0, path);
+        bc.isCategory  = GetPrivateProfileInt(sec, "IsCategory", 0, path);
+        bc.showIcon    = GetPrivateProfileInt(sec, "ShowIcon",   0, path);
+        bc.launchMode  = GetPrivateProfileInt(sec, "LaunchMode", 0, path);
+        if (bc.launchMode < 0 || bc.launchMode > 2) bc.launchMode = 0;
+
+        g_buttons[g_count]   = bc;
+        g_icons[g_count]     = NULL;
+        g_collapsed[g_count] = 0;
+        LoadSingleButtonIcon(g_count);
+        g_count++;
+        added++;
+    }
+
+    if (added > 0) {
+        SaveAll();
+        RefreshMainWindow();
+    }
+
+    char msg[256];
+    if (skipped > 0)
+        snprintf(msg, sizeof(msg),
+                 "Imported %d button(s). %d skipped (button list is full).", added, skipped);
+    else
+        snprintf(msg, sizeof(msg), "Imported %d button(s).", added);
+    MessageBox(g_hwndMain, msg, "Import", MB_OK | MB_ICONINFORMATION);
 }
 
 /* ── Environment variable expansion ─────────────────────────────────── */
@@ -2200,13 +2324,11 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 }
             }
 
-        } else if (id == ID_OPEN_INI) {
-            /* Use the fully-qualified system Notepad path to prevent a
-               rogue notepad.exe earlier on %PATH% from being executed. */
-            char notepadPath[MAX_PATH];
-            ExpandEnvironmentStrings("%SystemRoot%\\system32\\notepad.exe",
-                                     notepadPath, MAX_PATH);
-            ShellExecute(NULL, "open", notepadPath, g_iniPath, NULL, SW_SHOW);
+        } else if (id == ID_EXPORT_BUTTONS) {
+            ExportButtons();
+
+        } else if (id == ID_IMPORT_BUTTONS) {
+            ImportButtons();
 
         } else if (id == ID_HELP_INSTRUCTIONS) {
             ShowInfoDialog(hwnd, "Instructions",
@@ -2234,6 +2356,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 "create, or delete profiles. The Default profile (launcher.ini) "
                 "cannot be deleted. Profile files are named launcher_<name>.ini.\r\n"
                 "\r\n"
+                "EXPORT / IMPORT\r\n"
+                "Use Export Buttons (Profiles menu) to save the current button "
+                "list to a portable INI file. Use Import Buttons to append "
+                "buttons from a previously exported file into the active profile. "
+                "Imported buttons are added after any existing buttons.\r\n"
+                "\r\n"
                 "LAUNCH MODE\r\n"
                 "Normal: standard window. Minimized: starts in the taskbar. "
                 "Hidden: no window shown (useful for background scripts).\r\n"
@@ -2259,8 +2387,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 "\r\n"
                 "CONFIGURATION FILE\r\n"
                 "Settings are saved to launcher.ini (Default) or "
-                "launcher_<name>.ini for named profiles, next to launcher.exe. "
-                "Click 'Open INI' to open the active profile in Notepad.");
+                "launcher_<n>.ini for named profiles, next to launcher.exe.");
 
         } else if (id == ID_SETTINGS) {
             if (g_hwndDlg) { SetForegroundWindow(g_hwndDlg); break; }
@@ -2275,7 +2402,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         } else if (id == ID_HELP_ABOUT) {
             ShowInfoDialog(hwnd, "About Simple Launcher",
                 "Simple Launcher\r\n"
-                "Version 2.16\r\n"
+                "Version 2.17\r\n"
                 "\r\n"
                 "Author:   UberGuidoZ\r\n"
                 "Contact:  https://github.com/UberGuidoZ");
