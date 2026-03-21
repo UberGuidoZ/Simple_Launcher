@@ -1,5 +1,5 @@
 /*
- * simple_launcher.c - Simple Launcher v2.14
+ * simple_launcher.c - Simple Launcher v2.15
  *
  * Features:
  *   - INI-configured buttons with optional icons, separators, admin elevation
@@ -18,9 +18,10 @@
  *   - Compact mode - icon-only grid palette for a tiny always-on-top layout
  *   - Open file location from right-click context menu
  *   - Profiles - switchable INI sets from tray or Profiles menu
- *   - Environment variables — %VAR% expanded in path, args, and working dir
+ *   - Environment variables - %VAR% expanded in path, args, and working dir
  *   - Launch mode per button - Normal, Minimized, or Hidden
- *   - Version 2.14
+ *   - Drag-and-drop button reordering in the normal list view
+ *   - Version 2.15
  *
  * Compile:
  *
@@ -68,6 +69,9 @@ static void RecreateFont(void);
 static void SetTitleBarDark(HWND hwnd, int dark);
 static void ScanProfiles(void);
 static void SwitchProfile(int idx);
+static LRESULT CALLBACK ButtonSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
+                                            LPARAM lParam, UINT_PTR uIdSubclass,
+                                            DWORD_PTR dwRefData);
 
 /* ── IDs ─────────────────────────────────────────────────────────────── */
 #define ID_ADD_BTN            1
@@ -149,8 +153,8 @@ static void SwitchProfile(int idx);
 #define DK_SEP      RGB( 70,  70,  70)
 #define LT_SEP      RGB(160, 160, 160)
 #define DK_SEARCH   RGB( 40,  40,  40)
-#define DK_CAT_BG   RGB( 50,  75, 110)   /* category header — dark mode */
-#define LT_CAT_BG   RGB(200, 220, 245)   /* category header — light mode */
+#define DK_CAT_BG   RGB( 50,  75, 110)   /* category header - dark mode */
+#define LT_CAT_BG   RGB(200, 220, 245)   /* category header - light mode */
 #define DK_CAT_TEXT RGB(200, 225, 255)
 #define LT_CAT_TEXT RGB( 20,  50, 100)
 
@@ -231,6 +235,19 @@ static char         g_promptResult[64];
 static int          g_promptDone      = 0;
 static int          g_promptCancelled = 0;
 
+/* Drag-and-drop reorder state.
+   A drag starts when the user holds the left button down on a button window
+   and moves more than DRAG_THRESHOLD pixels. The source button index and the
+   initial cursor position are recorded. While dragging, g_dragDropIdx tracks
+   the insertion slot (0..g_count) shown by the drop indicator line.
+   Drag is only available in the normal list view (not compact mode, not
+   the filtered search view). */
+#define DRAG_THRESHOLD 4
+static int   g_dragging    = 0;   /* 1 while a drag is in progress */
+static int   g_dragSrcIdx  = -1;  /* g_buttons index of the button being dragged */
+static int   g_dragDropIdx = -1;  /* insertion slot currently under the cursor */
+static POINT g_dragStart;         /* cursor position when the button was pressed */
+
 static const char  *g_infoDlgTitle   = NULL;
 static const char  *g_infoDlgContent = NULL;
 
@@ -265,7 +282,7 @@ static void ApplyOpacity(void)
         SetLayeredWindowAttributes(g_hwndMain, 0,
                                    (BYTE)(g_opacity * 255 / 100), LWA_ALPHA);
     } else {
-        /* fully opaque — remove layered flag so rendering stays crisp */
+        /* fully opaque - remove layered flag so rendering stays crisp */
         SetWindowLong(g_hwndMain, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
     }
 }
@@ -534,7 +551,7 @@ static void SaveAll(void)
        If the path is too long to append ".tmp", fall back to a direct
        overwrite so the save still succeeds. */
     if (strlen(g_iniPath) + 5 >= MAX_PATH) {
-        /* Path too long for a .tmp suffix -- write directly. */
+        /* Path too long for a .tmp suffix - write directly. */
         FILE *f = fopen(g_iniPath, "w");
         if (!f) return;
         WriteINIBody(f);
@@ -564,7 +581,7 @@ static void ExpandEnvVars(const char *src, char *dst, DWORD dstSize)
     if (!src || !src[0]) { if (dst && dstSize) dst[0] = '\0'; return; }
     DWORD result = ExpandEnvironmentStrings(src, dst, dstSize);
     if (result == 0 || result > dstSize) {
-        /* Failed or overflow — copy as-is, safely truncated */
+        /* Failed or overflow - copy as-is, safely truncated */
         strncpy(dst, src, dstSize - 1);
         dst[dstSize - 1] = '\0';
     }
@@ -708,7 +725,7 @@ static void DrawButton(LPDRAWITEMSTRUCT dis, int idx)
     /* ── Separator ── */
     if (idx >= 0 && idx < g_count && g_buttons[idx].isSeparator) {
         /* Reuse the cached dark background brush; light mode uses the stock
-           system brush -- neither requires a per-paint alloc/free. */
+           system brush - neither requires a per-paint alloc/free. */
         HBRUSH hbr = g_darkMode ? g_hbrDkBg : (HBRUSH)(COLOR_BTNFACE + 1);
         FillRect(dis->hDC, &rc, hbr);
         int midY = (rc.top + rc.bottom) / 2;
@@ -833,7 +850,7 @@ static void RefreshMainWindow(void)
 
     int btnW = g_winWidth - 20;
 
-    /* Search bar — always visible */
+    /* Search bar - always visible */
     if (!g_hwndSearch) {
         g_hwndSearch = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "",
             WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL,
@@ -848,7 +865,7 @@ static void RefreshMainWindow(void)
     int y = 10 + 22 + 6;   /* below search bar */
 
     if (g_compactMode) {
-        /* ── Compact grid — icon tiles, no labels, skip separators+categories ── */
+        /* ── Compact grid - icon tiles, no labels, skip separators+categories ── */
         int sz = COMPACT_BTN_SZ, gap = COMPACT_BTN_GAP;
         int cols = (btnW + gap) / (sz + gap);
         if (cols < 1) cols = 1;
@@ -866,7 +883,7 @@ static void RefreshMainWindow(void)
         if (col > 0) y += sz + gap;
 
     } else if (g_filterText[0]) {
-        /* ── Flat filtered list — skip category structure ── */
+        /* ── Flat filtered list - skip category structure ── */
         for (int i = 0; i < g_count; i++) {
             if (!ButtonMatchesFilter(i)) continue;
             g_hwndBtns[i] = CreateWindow("BUTTON", g_buttons[i].name,
@@ -887,6 +904,7 @@ static void RefreshMainWindow(void)
                     WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 10, y, btnW, h,
                     g_hwndMain, (HMENU)(UINT_PTR)(ID_BUTTON_BASE + i), g_hInst, NULL);
                 if (g_hFontBold) SendMessage(g_hwndBtns[i], WM_SETFONT, (WPARAM)g_hFontBold, FALSE);
+                SetWindowSubclass(g_hwndBtns[i], ButtonSubclassProc, 0, (DWORD_PTR)i);
                 y += h + 3;
             } else if (catCollapsed) {
                 continue;
@@ -894,12 +912,14 @@ static void RefreshMainWindow(void)
                 g_hwndBtns[i] = CreateWindow("BUTTON", "", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
                     10, y, btnW, 14, g_hwndMain,
                     (HMENU)(UINT_PTR)(ID_BUTTON_BASE + i), g_hInst, NULL);
+                SetWindowSubclass(g_hwndBtns[i], ButtonSubclassProc, 0, (DWORD_PTR)i);
                 y += 14 + 5;
             } else {
                 g_hwndBtns[i] = CreateWindow("BUTTON", g_buttons[i].name,
                     WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 10, y, btnW, 26,
                     g_hwndMain, (HMENU)(UINT_PTR)(ID_BUTTON_BASE + i), g_hInst, NULL);
                 if (g_hFont) SendMessage(g_hwndBtns[i], WM_SETFONT, (WPARAM)g_hFont, FALSE);
+                SetWindowSubclass(g_hwndBtns[i], ButtonSubclassProc, 0, (DWORD_PTR)i);
                 y += 26 + 5;
             }
         }
@@ -1018,6 +1038,113 @@ static void ApplyFilter(void)
     SetWindowPos(g_hwndMain, NULL, 0, 0,
                  rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER);
     InvalidateRect(g_hwndMain, NULL, TRUE);
+}
+
+/* ── Drag-and-drop helpers ───────────────────────────────────────────── */
+
+/* Given a client-Y coordinate on the main window, returns the insertion
+   slot (0..g_count) at which a dropped button should be inserted.
+   Slot 0 = before all buttons; slot g_count = after all buttons.
+   Only visible buttons (those with an hwnd) are considered as slot
+   boundaries; hidden or collapsed buttons are skipped. */
+static int DropSlotFromClientY(int cy)
+{
+    int best     = g_count;
+    int bestDist = 0x7fffffff;
+    for (int i = 0; i < g_count; i++) {
+        if (!g_hwndBtns[i]) continue;
+        RECT r;
+        GetWindowRect(g_hwndBtns[i], &r);
+        POINT tl = { r.left, r.top };
+        ScreenToClient(g_hwndMain, &tl);
+        /* slot i is the gap above button i */
+        int dist = abs(cy - tl.y);
+        if (dist < bestDist) { bestDist = dist; best = i; }
+        /* also test the gap below the last button */
+        int botDist = abs(cy - (tl.y + (r.bottom - r.top)));
+        if (botDist < bestDist) { bestDist = botDist; best = i + 1; }
+    }
+    return best;
+}
+
+/* Draws (or erases) the horizontal drop-indicator line at slot dropIdx.
+   Called during WM_MOUSEMOVE and to erase the old line before drawing a
+   new one. Uses XOR mode so drawing twice restores the original pixels. */
+static void DrawDropLine(int dropIdx)
+{
+    if (dropIdx < 0 || dropIdx > g_count) return;
+
+    int lineY = -1;
+    for (int i = 0; i < g_count; i++) {
+        if (!g_hwndBtns[i]) continue;
+        RECT r;
+        GetWindowRect(g_hwndBtns[i], &r);
+        POINT tl = { r.left, r.top };
+        ScreenToClient(g_hwndMain, &tl);
+        if (i == dropIdx) { lineY = tl.y - 1; break; }
+        /* slot after the last visible button */
+        if (dropIdx == i + 1 && i == g_count - 1)
+            lineY = tl.y + (r.bottom - r.top);
+    }
+    /* If still not found, fall back to the first button top */
+    if (lineY < 0) {
+        for (int i = 0; i < g_count; i++) {
+            if (!g_hwndBtns[i]) continue;
+            RECT r;
+            GetWindowRect(g_hwndBtns[i], &r);
+            POINT tl = { r.left, r.top };
+            ScreenToClient(g_hwndMain, &tl);
+            lineY = (dropIdx == 0) ? tl.y - 1 : tl.y + (r.bottom - r.top);
+            break;
+        }
+    }
+    if (lineY < 0) return;
+
+    HDC hdc = GetDC(g_hwndMain);
+    /* R2_NOT inverts pixels so drawing twice cancels out (XOR line). */
+    int oldRop = SetROP2(hdc, R2_NOT);
+    HPEN hpen = CreatePen(PS_SOLID, 2, RGB(0, 0, 0));
+    HPEN hold = (HPEN)SelectObject(hdc, hpen);
+    RECT cr; GetClientRect(g_hwndMain, &cr);
+    MoveToEx(hdc, 10,            lineY, NULL);
+    LineTo  (hdc, cr.right - 10, lineY);
+    SelectObject(hdc, hold);
+    DeleteObject(hpen);
+    SetROP2(hdc, oldRop);
+    ReleaseDC(g_hwndMain, hdc);
+}
+
+/* Subclass procedure installed on every list-mode button.
+   Intercepts WM_LBUTTONDOWN before DefWindowProc so the BUTTON control
+   never calls SetCapture on itself. The main window takes capture here,
+   guaranteeing that all subsequent WM_MOUSEMOVE and WM_LBUTTONUP messages
+   arrive at MainProc rather than at the child button.
+   dwRefData carries the g_buttons[] index for this button. */
+static LRESULT CALLBACK ButtonSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
+                                            LPARAM lParam, UINT_PTR uIdSubclass,
+                                            DWORD_PTR dwRefData)
+{
+    if (msg == WM_LBUTTONDOWN) {
+        int idx = (int)dwRefData;
+        /* lParam is in the button's own client coords; convert to main-window client. */
+        POINT pt = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+        ClientToScreen(hwnd, &pt);
+        ScreenToClient(g_hwndMain, &pt);
+
+        g_dragStart   = pt;
+        g_dragSrcIdx  = idx;
+        g_dragging    = 0;
+        g_dragDropIdx = -1;
+
+        /* Take capture on the main window before DefWindowProc runs.
+           Because we return 0 without calling DefSubclassProc, the BUTTON
+           control never executes its own WM_LBUTTONDOWN handler and never
+           calls SetCapture, so the main window keeps capture exclusively. */
+        SetCapture(g_hwndMain);
+        return 0;
+    }
+    (void)uIdSubclass;
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
 /* ── Right-click context menu ────────────────────────────────────────── */
@@ -1224,7 +1351,7 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-/* ── Prompt dialog (single text input — used for new profile name) ───── */
+/* ── Prompt dialog (single text input - used for new profile name) ───── */
 static HBRUSH g_hbrPromptBg = NULL;
 
 static LRESULT CALLBACK PromptDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -1668,6 +1795,105 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         }
         return 0;
 
+    case WM_MOUSEMOVE: {
+        if (g_dragSrcIdx < 0) break;   /* no button pressed */
+        POINT cur = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+
+        if (!g_dragging) {
+            /* Check whether the cursor has moved past the drag threshold. */
+            if (abs(cur.x - g_dragStart.x) < DRAG_THRESHOLD &&
+                abs(cur.y - g_dragStart.y) < DRAG_THRESHOLD) break;
+            /* Threshold exceeded: begin the visual drag. */
+            g_dragging = 1;
+            SetCursor(LoadCursor(NULL, IDC_SIZENS));
+        }
+
+        /* Erase old drop line, compute new slot, draw new drop line. */
+        if (g_dragDropIdx >= 0) DrawDropLine(g_dragDropIdx);
+        g_dragDropIdx = DropSlotFromClientY(cur.y);
+        /* Prevent dropping on the source slot or the one directly after it
+           (which would leave the button in the same position). */
+        if (g_dragDropIdx == g_dragSrcIdx || g_dragDropIdx == g_dragSrcIdx + 1)
+            g_dragDropIdx = -1;
+        if (g_dragDropIdx >= 0) DrawDropLine(g_dragDropIdx);
+        SetCursor(LoadCursor(NULL, IDC_SIZENS));
+        return 0;
+    }
+
+    case WM_LBUTTONUP: {
+        if (g_dragSrcIdx < 0) break;
+
+        if (!g_dragging) {
+            /* User clicked without crossing the drag threshold. ButtonSubclassProc
+               stole capture so the button never received WM_LBUTTONUP and never
+               fired BN_CLICKED. Post WM_COMMAND now to simulate it. */
+            int idx = g_dragSrcIdx;
+            g_dragSrcIdx = -1;
+            ReleaseCapture();
+            PostMessage(hwnd, WM_COMMAND,
+                        MAKEWPARAM(ID_BUTTON_BASE + idx, BN_CLICKED),
+                        g_hwndBtns[idx] ? (LPARAM)g_hwndBtns[idx] : 0);
+            break;
+        }
+        /* End drag: save src/dst and clear ALL drag state BEFORE calling
+           ReleaseCapture. ReleaseCapture sends WM_CAPTURECHANGED synchronously
+           (it does not return until the handler finishes). WM_CAPTURECHANGED
+           checks g_dragging to decide whether to cancel; clearing it here first
+           makes that handler a no-op so the drop line is not redrawn and the
+           state is not double-zeroed. */
+        int src = g_dragSrcIdx, dst = g_dragDropIdx;
+        g_dragging    = 0;
+        g_dragSrcIdx  = -1;
+        g_dragDropIdx = -1;
+        if (dst >= 0) DrawDropLine(dst);   /* erase the indicator line */
+        ReleaseCapture();
+        SetCursor(LoadCursor(NULL, IDC_ARROW));
+
+        if (dst >= 0 && dst != src && dst != src + 1) {
+            /* Move the button from src to dst (adjusting for removal offset). */
+            ButtonConfig tmp  = g_buttons[src];
+            HICON        icon = g_icons[src];
+            int          col  = g_collapsed[src];
+
+            /* Shift the gap left by removing src. */
+            for (int i = src; i < g_count - 1; i++) {
+                g_buttons[i]   = g_buttons[i + 1];
+                g_icons[i]     = g_icons[i + 1];
+                g_collapsed[i] = g_collapsed[i + 1];
+            }
+            /* Adjust dst for the removal. */
+            if (dst > src) dst--;
+            /* Open the gap at dst by shifting right. */
+            for (int i = g_count - 1; i > dst; i--) {
+                g_buttons[i]   = g_buttons[i - 1];
+                g_icons[i]     = g_icons[i - 1];
+                g_collapsed[i] = g_collapsed[i - 1];
+            }
+            g_buttons[dst]   = tmp;
+            g_icons[dst]     = icon;
+            g_collapsed[dst] = col;
+
+            SaveAll();
+            RefreshMainWindow();
+        }
+        return 0;
+    }
+
+    case WM_CAPTURECHANGED: {
+        /* If mouse capture is stolen (e.g. by a dialog), cancel the drag cleanly.
+           g_dragSrcIdx is cleared unconditionally because capture can be stolen
+           before the drag threshold is crossed, leaving g_dragging at 0 while
+           g_dragSrcIdx is still set. */
+        if (g_dragging) {
+            if (g_dragDropIdx >= 0) DrawDropLine(g_dragDropIdx);
+            g_dragging    = 0;
+            g_dragDropIdx = -1;
+            SetCursor(LoadCursor(NULL, IDC_ARROW));
+        }
+        g_dragSrcIdx = -1;
+        break;
+    }
+
     case WM_CONTEXTMENU: {
         /* wParam = HWND that was right-clicked */
         HWND hClicked = (HWND)wParam;
@@ -1711,7 +1937,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             HFONT hOld = (HFONT)SelectObject(hdc, hMenuFont);
             SIZE sz; GetTextExtentPoint32(hdc, label, (int)strlen(label), &sz);
             SelectObject(hdc, hOld); ReleaseDC(hwnd, hdc);
-            mis->itemWidth  = sz.cx + 4;   /* minimal padding — 5 items must fit in one row */
+            mis->itemWidth  = sz.cx + 4;   /* minimal padding - 5 items must fit in one row */
             mis->itemHeight = GetSystemMetrics(SM_CYMENU); /* match system bar height exactly */
             return TRUE;
         }
@@ -1999,6 +2225,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 "RIGHT-CLICK MENU\r\n"
                 "Edit, Duplicate, Open File Location, Delete, Move Up/Down.\r\n"
                 "\r\n"
+                "DRAG-AND-DROP REORDERING\r\n"
+                "In the normal list view, hold the left mouse button on any button "
+                "and drag it up or down to reorder it. A horizontal line shows where "
+                "the button will land when you release. Drag-and-drop is not available "
+                "in compact mode or while the search bar is active.\r\n"
+                "\r\n"
                 "CONFIGURATION FILE\r\n"
                 "Settings are saved to launcher.ini (Default) or "
                 "launcher_<name>.ini for named profiles, next to launcher.exe. "
@@ -2017,7 +2249,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         } else if (id == ID_HELP_ABOUT) {
             ShowInfoDialog(hwnd, "About Simple Launcher",
                 "Simple Launcher\r\n"
-                "Version 2.14\r\n"
+                "Version 2.15\r\n"
                 "\r\n"
                 "Author:   UberGuidoZ\r\n"
                 "Contact:  https://github.com/UberGuidoZ");
@@ -2105,7 +2337,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
        are needed in both dark and light mode. */
     EnsureDarkGDI();
 
-    /* Register dialog window classes — reuse one struct, vary only proc + name */
+    /* Register dialog window classes - reuse one struct, vary only proc + name */
     WNDCLASS wcd = {0};
     wcd.hInstance    = hInstance;
     wcd.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
