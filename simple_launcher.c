@@ -1,5 +1,5 @@
 /*
- * simple_launcher.c - Simple Launcher v2.15
+ * simple_launcher.c - Simple Launcher v2.16
  *
  * Features:
  *   - INI-configured buttons with optional icons, separators, admin elevation
@@ -21,7 +21,7 @@
  *   - Environment variables - %VAR% expanded in path, args, and working dir
  *   - Launch mode per button - Normal, Minimized, or Hidden
  *   - Drag-and-drop button reordering in the normal list view
- *   - Version 2.15
+ *   - Version 2.16
  *
  * Compile:
  *
@@ -69,6 +69,8 @@ static void RecreateFont(void);
 static void SetTitleBarDark(HWND hwnd, int dark);
 static void ScanProfiles(void);
 static void SwitchProfile(int idx);
+static int  DropSlotFromClientY(int cy);
+static void DrawDropLine(int dropIdx);
 static LRESULT CALLBACK ButtonSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
                                             LPARAM lParam, UINT_PTR uIdSubclass,
                                             DWORD_PTR dwRefData);
@@ -211,6 +213,7 @@ static HBRUSH       g_hbrLtCatPre  = NULL;    /* cached pressed light-mode categ
 static HPEN         g_hpenDkBorder = NULL;    /* cached DK_BORDER outline pen */
 static HPEN         g_hpenDkSep    = NULL;    /* cached DK_SEP separator pen */
 static HPEN         g_hpenLtSep    = NULL;    /* cached LT_SEP separator pen */
+static HPEN         g_hpenDragLine = NULL;    /* cached drag-drop indicator pen */
 static HPEN         g_hpenAdminBorder = NULL; /* cached admin border pen */
 static COLORREF     g_hpenAdminColor  = (COLORREF)-1; /* tracks color used for the cached pen */
 static HFONT        g_hFont        = NULL;
@@ -247,6 +250,11 @@ static int   g_dragging    = 0;   /* 1 while a drag is in progress */
 static int   g_dragSrcIdx  = -1;  /* g_buttons index of the button being dragged */
 static int   g_dragDropIdx = -1;  /* insertion slot currently under the cursor */
 static POINT g_dragStart;         /* cursor position when the button was pressed */
+
+/* Cached system cursors - loaded once at startup to avoid repeated LoadCursor
+   calls inside WM_MOUSEMOVE and WM_LBUTTONUP during drag operations. */
+static HCURSOR g_curArrow  = NULL;
+static HCURSOR g_curSizeNS = NULL;
 
 static const char  *g_infoDlgTitle   = NULL;
 static const char  *g_infoDlgContent = NULL;
@@ -385,6 +393,11 @@ static void ScanProfiles(void)
 static void SwitchProfile(int idx)
 {
     if (idx < 0 || idx >= g_profileCount || idx == g_activeProfile) return;
+    /* Cancel any in-flight drag so the new profile's buttons do not receive
+       a phantom BN_CLICKED or leftover drag state from the old layout. */
+    if (g_dragging && g_dragDropIdx >= 0) DrawDropLine(g_dragDropIdx);
+    g_dragging = 0; g_dragSrcIdx = -1; g_dragDropIdx = -1;
+    if (GetCapture() == g_hwndMain) ReleaseCapture();
     SaveAll();
     g_activeProfile = idx;
     strcpy(g_iniPath, g_profilePaths[idx]);
@@ -488,15 +501,22 @@ static void LoadButtons(void)
     }
 }
 
-/* Writes key=value to f, replacing any CR, LF, or '[' in value with a space.
-   CR/LF prevent a user-supplied string from injecting extra INI lines.
-   '[' prevents a value from being mis-parsed as a section header by some
-   INI readers if it appears at the start of a line after line continuation. */
+/* Writes key=value to f, replacing any character that could corrupt the INI
+   structure with a space.  CR and LF are stripped to prevent a value from
+   injecting extra key/value lines.  '[' and ']' are stripped to prevent a
+   value from being mis-parsed as a section header ([Button99]) by INI readers
+   that do not quote values, even if the bracket appears mid-value after a
+   newline injected through some other path. */
 static void WriteEscaped(FILE *f, const char *key, const char *val)
 {
     fprintf(f, "%s=", key);
-    for (; *val; val++)
-        fputc((*val == '\r' || *val == '\n' || *val == '[') ? ' ' : *val, f);
+    for (; *val; val++) {
+        char c = *val;
+        if (c == '\r' || c == '\n' || c == '[' || c == ']')
+            fputc(' ', f);
+        else
+            fputc(c, f);
+    }
     fputs("\r\n", f);
 }
 
@@ -608,6 +628,7 @@ static void EnsureDarkGDI(void)
     if (!g_hpenDkBorder) g_hpenDkBorder = CreatePen(PS_SOLID, 1, DK_BORDER);
     if (!g_hpenDkSep)    g_hpenDkSep    = CreatePen(PS_SOLID, 1, DK_SEP);
     if (!g_hpenLtSep)    g_hpenLtSep    = CreatePen(PS_SOLID, 1, LT_SEP);
+    if (!g_hpenDragLine) g_hpenDragLine = CreatePen(PS_SOLID, 2, RGB(0, 0, 0));
 }
 
 /* Releases all cached dark-mode GDI objects. Called when toggling dark mode
@@ -624,6 +645,7 @@ static void FreeDarkGDI(void)
     if (g_hpenDkBorder)    { DeleteObject(g_hpenDkBorder);    g_hpenDkBorder    = NULL; }
     if (g_hpenDkSep)       { DeleteObject(g_hpenDkSep);       g_hpenDkSep       = NULL; }
     if (g_hpenLtSep)       { DeleteObject(g_hpenLtSep);       g_hpenLtSep       = NULL; }
+    if (g_hpenDragLine)    { DeleteObject(g_hpenDragLine);    g_hpenDragLine    = NULL; }
     if (g_hpenAdminBorder) { DeleteObject(g_hpenAdminBorder); g_hpenAdminBorder = NULL;
                              g_hpenAdminColor = (COLORREF)-1; }
 }
@@ -672,7 +694,6 @@ static void DrawButton(LPDRAWITEMSTRUCT dis, int idx)
     /* ── Compact tile (non-Add) ── */
     if (g_compactMode && idx >= 0) {
         if (g_darkMode) {
-            EnsureDarkGDI();
             FillRect(dis->hDC, &rc, pressed ? g_hbrDkBtnPre : g_hbrDkBtn);
             HPEN hop = (HPEN)SelectObject(dis->hDC, g_hpenDkBorder);
             HBRUSH hn = (HBRUSH)SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
@@ -729,7 +750,6 @@ static void DrawButton(LPDRAWITEMSTRUCT dis, int idx)
         HBRUSH hbr = g_darkMode ? g_hbrDkBg : (HBRUSH)(COLOR_BTNFACE + 1);
         FillRect(dis->hDC, &rc, hbr);
         int midY = (rc.top + rc.bottom) / 2;
-        EnsureDarkGDI();
         HPEN hOld = (HPEN)SelectObject(dis->hDC,
                         g_darkMode ? g_hpenDkSep : g_hpenLtSep);
         MoveToEx(dis->hDC, rc.left + 6, midY, NULL);
@@ -741,7 +761,6 @@ static void DrawButton(LPDRAWITEMSTRUCT dis, int idx)
     /* ── Normal button ── */
     int isAdmin = (idx >= 0 && idx < g_count) ? g_buttons[idx].admin : 0;
     if (g_darkMode) {
-        EnsureDarkGDI();
         FillRect(dis->hDC, &rc, pressed ? g_hbrDkBtnPre : g_hbrDkBtn);
         HPEN   hOldP = (HPEN)SelectObject(dis->hDC, g_hpenDkBorder);
         HBRUSH hNull = (HBRUSH)SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
@@ -793,8 +812,10 @@ static void ApplyDarkBackground(void)
     if (g_darkMode) {
         g_hbrDkBg     = CreateSolidBrush(DK_BG);
         g_hbrSearchDk = CreateSolidBrush(DK_SEARCH);
-        EnsureDarkGDI();
     }
+    /* Recreate shared GDI objects unconditionally - category brushes and
+       separator pens are used in both dark and light mode. */
+    EnsureDarkGDI();
     if (g_hwndSearch) InvalidateRect(g_hwndSearch, NULL, TRUE);
 }
 
@@ -1103,13 +1124,12 @@ static void DrawDropLine(int dropIdx)
     HDC hdc = GetDC(g_hwndMain);
     /* R2_NOT inverts pixels so drawing twice cancels out (XOR line). */
     int oldRop = SetROP2(hdc, R2_NOT);
-    HPEN hpen = CreatePen(PS_SOLID, 2, RGB(0, 0, 0));
-    HPEN hold = (HPEN)SelectObject(hdc, hpen);
+    /* Use the cached drag-line pen; always available via EnsureDarkGDI. */
+    HPEN hold = (HPEN)SelectObject(hdc, g_hpenDragLine);
     RECT cr; GetClientRect(g_hwndMain, &cr);
     MoveToEx(hdc, 10,            lineY, NULL);
     LineTo  (hdc, cr.right - 10, lineY);
     SelectObject(hdc, hold);
-    DeleteObject(hpen);
     SetROP2(hdc, oldRop);
     ReleaseDC(g_hwndMain, hdc);
 }
@@ -1602,6 +1622,7 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 g_buttons[ti].admin       = 0;
                 g_buttons[ti].showIcon    = 0;
                 g_buttons[ti].isCategory  = 0;
+                g_buttons[ti].launchMode  = 0;
             } else if (isCat) {
                 strcpy(g_buttons[ti].name, name);
                 g_buttons[ti].path[0]     = 0;
@@ -1611,6 +1632,7 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 g_buttons[ti].admin       = 0;
                 g_buttons[ti].showIcon    = 0;
                 g_buttons[ti].isCategory  = 1;
+                g_buttons[ti].launchMode  = 0;
             } else {
                 char iconPath[MAX_PATH], workDir[MAX_PATH];
                 GetDlgItemText(hwnd, IDC_ICON_PATH_EDIT, iconPath, MAX_PATH);
@@ -1805,7 +1827,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 abs(cur.y - g_dragStart.y) < DRAG_THRESHOLD) break;
             /* Threshold exceeded: begin the visual drag. */
             g_dragging = 1;
-            SetCursor(LoadCursor(NULL, IDC_SIZENS));
+            SetCursor(g_curSizeNS);
         }
 
         /* Erase old drop line, compute new slot, draw new drop line. */
@@ -1816,7 +1838,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         if (g_dragDropIdx == g_dragSrcIdx || g_dragDropIdx == g_dragSrcIdx + 1)
             g_dragDropIdx = -1;
         if (g_dragDropIdx >= 0) DrawDropLine(g_dragDropIdx);
-        SetCursor(LoadCursor(NULL, IDC_SIZENS));
+        SetCursor(g_curSizeNS);
         return 0;
     }
 
@@ -1847,7 +1869,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         g_dragDropIdx = -1;
         if (dst >= 0) DrawDropLine(dst);   /* erase the indicator line */
         ReleaseCapture();
-        SetCursor(LoadCursor(NULL, IDC_ARROW));
+        SetCursor(g_curArrow);
 
         if (dst >= 0 && dst != src && dst != src + 1) {
             /* Move the button from src to dst (adjusting for removal offset). */
@@ -1888,7 +1910,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             if (g_dragDropIdx >= 0) DrawDropLine(g_dragDropIdx);
             g_dragging    = 0;
             g_dragDropIdx = -1;
-            SetCursor(LoadCursor(NULL, IDC_ARROW));
+            SetCursor(g_curArrow);
         }
         g_dragSrcIdx = -1;
         break;
@@ -2039,6 +2061,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 }
                 g_icons[g_count - 1]     = NULL;
                 g_collapsed[g_count - 1] = 0;
+                memset(&g_buttons[g_count - 1], 0, sizeof(ButtonConfig));
                 g_count--;
                 SaveAll(); RefreshMainWindow();
             }
@@ -2048,10 +2071,13 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             if (g_count >= MAX_BUTTONS) {
                 MessageBox(hwnd, "Maximum number of buttons reached.", "Error", MB_OK | MB_ICONWARNING);
             } else {
-                /* Shift everything after the source down one slot */
+                /* Shift everything after the source down one slot.
+                   Icons must be carried forward with their button data;
+                   the old code set g_icons[i] = NULL which silently dropped
+                   the icon for every button below the duplicate point. */
                 for (int i = g_count; i > g_ctxIndex + 1; i--) {
                     g_buttons[i]   = g_buttons[i - 1];
-                    g_icons[i]     = NULL;
+                    g_icons[i]     = g_icons[i - 1];
                     g_collapsed[i] = g_collapsed[i - 1];
                 }
                 /* Copy the source into the slot immediately below it */
@@ -2249,7 +2275,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         } else if (id == ID_HELP_ABOUT) {
             ShowInfoDialog(hwnd, "About Simple Launcher",
                 "Simple Launcher\r\n"
-                "Version 2.15\r\n"
+                "Version 2.16\r\n"
                 "\r\n"
                 "Author:   UberGuidoZ\r\n"
                 "Contact:  https://github.com/UberGuidoZ");
@@ -2322,7 +2348,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     /* Initialize COM for the apartment so SHBrowseForFolder with
        BIF_NEWDIALOGSTYLE and other shell operations work reliably. */
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-    InitCommonControls();   /* required to register TOOLTIPS_CLASS and other common controls */
+    /* InitCommonControlsEx replaces the deprecated InitCommonControls and
+       explicitly registers the standard and tooltip window classes used here. */
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES };
+    InitCommonControlsEx(&icc);
+    /* Cache stock cursors once so drag handlers never call LoadCursor per message. */
+    g_curArrow  = LoadCursor(NULL, IDC_ARROW);
+    g_curSizeNS = LoadCursor(NULL, IDC_SIZENS);
     GetBasePath();
     ScanProfiles();
     LoadSettings();
