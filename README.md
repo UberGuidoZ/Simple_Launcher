@@ -13,7 +13,6 @@ Features:
  * Remembers last window position
  * Tooltips showing path, args, and working directory on hover
  * Working directory field per button
- * Open INI in Notepad from menu bar
  * Categories - collapsible group headers to organise buttons
  * Search / filter bar - type to instantly filter buttons by name
  * Compact mode - icon-only grid palette for a tiny always-on-top layout
@@ -22,6 +21,7 @@ Features:
  * Environment variables - %VAR% expanded in path, args, and working dir
  * Launch mode per button - Normal, Minimized, or Hidden
  * Drag-and-drop button reordering in the normal list view
+ * Export / Import buttons to and from a portable INI snippet file
 
 ![Example use](https://raw.githubusercontent.com/UberGuidoZ/Simple_Launcher/refs/heads/main/Documentation/6-Example_Use.gif)
 
