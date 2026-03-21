@@ -21,6 +21,7 @@ Features:
  * Profiles - switchable INI sets from tray or Profiles menu
  * Environment variables - %VAR% expanded in path, args, and working dir
  * Launch mode per button - Normal, Minimized, or Hidden
+ * Drag-and-drop button reordering in the normal list view
 
 ![Example use](https://raw.githubusercontent.com/UberGuidoZ/Simple_Launcher/refs/heads/main/Documentation/6-Example_Use.gif)
 
