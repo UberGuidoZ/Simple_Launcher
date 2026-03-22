@@ -1,5 +1,5 @@
 /*
- * simple_launcher.c - Simple Launcher v2.17
+ * simple_launcher.c - Simple Launcher v2.18
  *
  * Features:
  *   - INI-configured buttons with optional icons, separators, admin elevation
@@ -21,11 +21,45 @@
  *   - Launch mode per button - Normal, Minimized, or Hidden
  *   - Drag-and-drop button reordering in the normal list view
  *   - Export / Import buttons to and from a portable INI snippet file
- *   - Version 2.17
+ *   - Version 2.18
  *
  * Compile:
  *
  *   cl simple_launcher.c simple_launcher.res /link user32.lib shell32.lib comdlg32.lib gdi32.lib dwmapi.lib ole32.lib comctl32.lib /subsystem:windows /out:simple_launcher.exe
+ */
+
+/*
+ * v2.18 -- Bug Fixes, Security, Minor
+ *
+ * Bug Fixes
+ *   - Fixed DrawDropLine fallback Y coordinate being wrong for any dropIdx > 1.
+ *     The previous fallback always stopped at the first visible button, drawing
+ *     the drop indicator at the wrong position. The fallback now walks backward
+ *     from the last visible button to find the correct slot boundary.
+ *   - Fixed GetBasePath off-by-one in the .ini extension boundary check.
+ *     The guard (dot - g_basePath) + 5 < MAX_PATH was one position too strict
+ *     and silently dropped the .ini extension when the path filled the buffer
+ *     exactly. Corrected to <= MAX_PATH.
+ *   - Fixed SaveAll leaving a .tmp file behind when MoveFileEx fails. The
+ *     return value was previously ignored; on failure the orphaned temp file
+ *     is now removed with DeleteFile(tmpPath) so it does not accumulate.
+ *
+ * Security
+ *   - Fixed LoadIconForSlot applying no UNC/device path guard to the iconPath
+ *     field. A malicious or corrupted INI could specify \\evil.server\share\x.ico
+ *     and trigger an outbound SMB connection or object-manager side-effect.
+ *     iconPath now rejects any path beginning with \\ or //. The path field
+ *     (target executable) is intentionally not restricted because users may
+ *     legitimately launch programs from network shares.
+ *
+ * Minor
+ *   - Fixed ExpandEnvVars DWORD underflow: when dstSize == 0 the fallback
+ *     strncpy(dst, src, dstSize - 1) wraps to 0xFFFFFFFF, causing a potential
+ *     multi-gigabyte overrun. A zero-size guard is now added at entry.
+ *   - Fixed tooltip builder launchMode == 2 branch missing pos +=. The
+ *     launchMode == 1 branch correctly accumulated the snprintf return value;
+ *     the == 2 branch discarded it, leaving pos stale. Inconsistent and fragile
+ *     if the block is extended.
  */
 
 #include <windows.h>
@@ -346,7 +380,11 @@ static void GetBasePath(void)
     GetModuleFileName(NULL, g_basePath, MAX_PATH);
     char *dot = strrchr(g_basePath, '.');
     if (dot) {
-        if ((dot - g_basePath) + 5 < MAX_PATH)
+        /* strcpy(dot, ".ini") writes 5 bytes (.ini + NUL).  The last valid
+           write position is (MAX_PATH - 5), so the correct guard is <= MAX_PATH.
+           The previous check (< MAX_PATH) was one position too strict and would
+           silently drop the extension when the path filled the buffer exactly. */
+        if ((dot - g_basePath) + 5 <= MAX_PATH)
             strcpy(dot, ".ini");
     } else {
         size_t len = strlen(g_basePath);
@@ -595,9 +633,12 @@ static void SaveAll(void)
     fclose(f);
 
     /* Atomic replace: the old INI is only overwritten after the new data
-       has been fully flushed and closed. */
-    MoveFileEx(tmpPath, g_iniPath,
-               MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+       has been fully flushed and closed.  If MoveFileEx fails (e.g. target
+       locked by a concurrent reader), delete the orphaned .tmp so it does
+       not accumulate across failed saves. */
+    if (!MoveFileEx(tmpPath, g_iniPath,
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        DeleteFile(tmpPath);
 }
 
 /* ── Export / Import ─────────────────────────────────────────────────── */
@@ -723,6 +764,9 @@ static void ImportButtons(void)
 static void ExpandEnvVars(const char *src, char *dst, DWORD dstSize)
 {
     if (!src || !src[0]) { if (dst && dstSize) dst[0] = '\0'; return; }
+    /* Guard against DWORD underflow: dstSize-1 wraps to 0xFFFFFFFF when
+       dstSize==0, causing strncpy to copy up to 4 GB in the fallback path. */
+    if (dstSize == 0) return;
     DWORD result = ExpandEnvironmentStrings(src, dst, dstSize);
     if (result == 0 || result > dstSize) {
         /* Failed or overflow - copy as-is, safely truncated */
@@ -783,6 +827,16 @@ static void LoadIconForSlot(int i)
     const char *src = g_buttons[i].iconPath[0] ? g_buttons[i].iconPath
                                                 : g_buttons[i].path;
     if (!src[0]) return;
+    /* Reject UNC paths (\\server\share) and Win32 device paths (\\.\, \\?\)
+       in the iconPath field to prevent a malicious or corrupted INI from
+       triggering an outbound SMB connection or object-manager side-effect.
+       The path field (target executable) is intentionally not restricted
+       here because users may legitimately launch programs from network shares. */
+    if (src == g_buttons[i].iconPath) {
+        if ((src[0] == '\\' && src[1] == '\\') ||
+            (src[0] == '/'  && src[1] == '/'))
+            return;
+    }
     /* Try loading as a standalone .ico / .png first */
     HICON hIco = (HICON)LoadImage(NULL, src, IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
     if (hIco) { g_icons[i] = hIco; return; }
@@ -1112,8 +1166,8 @@ static void RefreshMainWindow(void)
                     pos += snprintf(tip + pos, sizeof(g_tooltipText[i]) - pos,
                                     "\n[Launch Minimized]");
                 else if (g_buttons[i].launchMode == 2)
-                    snprintf(tip + pos, sizeof(g_tooltipText[i]) - pos,
-                             "\n[Launch Hidden]");
+                    pos += snprintf(tip + pos, sizeof(g_tooltipText[i]) - pos,
+                                    "\n[Launch Hidden]");
             }
             TOOLINFO ti; ZeroMemory(&ti, sizeof(ti));
             ti.cbSize   = sizeof(TOOLINFO);
@@ -1231,15 +1285,21 @@ static void DrawDropLine(int dropIdx)
         if (dropIdx == i + 1 && i == g_count - 1)
             lineY = tl.y + (r.bottom - r.top);
     }
-    /* If still not found, fall back to the first button top */
+    /* If still not found, walk backward from the last visible button to find
+       the nearest slot boundary. The previous forward-only scan always stopped
+       at the FIRST visible button, which placed the indicator at the wrong Y
+       for any dropIdx > 1. */
     if (lineY < 0) {
-        for (int i = 0; i < g_count; i++) {
+        for (int i = g_count - 1; i >= 0; i--) {
             if (!g_hwndBtns[i]) continue;
             RECT r;
             GetWindowRect(g_hwndBtns[i], &r);
             POINT tl = { r.left, r.top };
             ScreenToClient(g_hwndMain, &tl);
-            lineY = (dropIdx == 0) ? tl.y - 1 : tl.y + (r.bottom - r.top);
+            if (dropIdx > i)
+                lineY = tl.y + (r.bottom - r.top);  /* below last visible */
+            else
+                lineY = tl.y - 1;                   /* above first visible */
             break;
         }
     }
@@ -2402,7 +2462,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         } else if (id == ID_HELP_ABOUT) {
             ShowInfoDialog(hwnd, "About Simple Launcher",
                 "Simple Launcher\r\n"
-                "Version 2.17\r\n"
+                "Version 2.18\r\n"
                 "\r\n"
                 "Author:   UberGuidoZ\r\n"
                 "Contact:  https://github.com/UberGuidoZ");
