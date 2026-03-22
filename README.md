@@ -23,6 +23,7 @@ Features:
  * Drag-and-drop button reordering in the normal list view
  * Export / Import buttons to and from a portable INI snippet file
 
+# Screenshots (v1.91)
 ![Example use](https://raw.githubusercontent.com/UberGuidoZ/Simple_Launcher/refs/heads/main/Documentation/6-Example_Use.gif)
 
 Main Window<br>
